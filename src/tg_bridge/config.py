@@ -16,6 +16,9 @@ ROBOT = "\U0001f916"
 DEFAULT_PREFIX = f"{ROBOT} "
 MAX_PREFIX_UTF16 = 64  # the split limit leaves this much room below Telegram's 4096
 DEFAULT_CONFIG_FILE = "~/.config/agora-tg-bridge/config.toml"
+BACKENDS = ("telethon", "mcp")
+DEFAULT_BACKEND = "telethon"
+DEFAULT_SESSION_FILE = "~/.local/share/agora-tg-bridge/session.json"
 DEFAULT_HUB = "http://127.0.0.1:8790"
 DEFAULT_TOKEN_FILE = "~/.config/mcp-hub/client.token"
 DEFAULT_TOKEN_VAR = "MCP_HUB_TOKEN"
@@ -25,6 +28,10 @@ CUSTOM_EMOJI_ID = re.compile(r"[0-9]{1,20}")
 # Keys the config file may set, with their types; the chat is per bridge and
 # stays on the command line.
 FILE_KEYS: dict[str, tuple[type, ...]] = {
+    "backend": (str,),
+    "session": (str,),
+    "api_id": (int,),
+    "api_hash": (str,),
     "account": (str,),
     "hub_url": (str,),
     "token_file": (str,),
@@ -34,6 +41,11 @@ FILE_KEYS: dict[str, tuple[type, ...]] = {
     "prefix": (str,),
     "custom_emoji_id": (str, int),
 }
+
+
+# The API keys (api_id, api_hash) are read only by `tg-bridge login`; the
+# session file keeps them afterwards.
+LOGIN_KEYS = frozenset(key for key in FILE_KEYS if key.startswith("api_"))
 
 
 class ConfigError(Exception):
@@ -51,6 +63,8 @@ class Config:
     wait_seconds: float
     prefix: str = DEFAULT_PREFIX
     custom_emoji_id: str | None = None
+    backend: str = DEFAULT_BACKEND
+    session_file: Path = Path(DEFAULT_SESSION_FILE)
 
     @property
     def mcp_url(self) -> str:
@@ -107,7 +121,9 @@ def load_config_file(path: Path, *, required: bool) -> dict[str, Any]:
     return values
 
 
-def parse_args(argv: list[str] | None = None) -> Config:
+def file_defaults(argv: list[str] | None) -> dict[str, Any]:
+    """The config file's values: `--config` names it, else the default file
+    is read when it exists."""
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config")
     known, rest = pre.parse_known_args(argv)
@@ -120,27 +136,53 @@ def parse_args(argv: list[str] | None = None) -> Config:
         if "-h" not in rest and "--help" not in rest:
             raise
         file_values = {}  # help works with a broken config file
+    return file_values
 
-    parser = argparse.ArgumentParser(
-        prog="tg-bridge",
-        description="Agora bridge for one Telegram chat (JSON lines on stdin/stdout).",
-    )
-    parser.add_argument("--chat", required=True, help="numeric chat id (e.g. -1001234567890)")
+
+def add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_FILE,
         help="TOML file with defaults for the other options (read when it exists)",
     )
     parser.add_argument(
+        "--session",
+        default=DEFAULT_SESSION_FILE,
+        help="Telethon backend: the session file written by `tg-bridge login`",
+    )
+
+
+def session_path(value: str) -> Path:
+    return Path(os.path.expanduser(value))
+
+
+def parse_args(argv: list[str] | None = None) -> Config:
+    file_values = file_defaults(argv)
+    parser = argparse.ArgumentParser(
+        prog="tg-bridge",
+        description="Agora bridge for one Telegram chat (JSON lines on stdin/stdout).",
+        epilog="Other commands: `tg-bridge login` writes the Telethon session file, "
+        "`tg-bridge chats` lists your chats with their numeric ids.",
+    )
+    parser.add_argument("--chat", required=True, help="numeric chat id (e.g. -1001234567890)")
+    parser.add_argument(
+        "--backend",
+        default=DEFAULT_BACKEND,
+        help="telethon (own session, `tg-bridge login`) or mcp (telegram-mcp behind an MCP hub)",
+    )
+    add_common_options(parser)
+    parser.add_argument(
         "--account",
         default="personal",
-        help="account name; the endpoint is <hub-url>/telegram-<account>/mcp",
+        help="MCP backend: account name; the endpoint is <hub-url>/telegram-<account>/mcp",
     )
-    parser.add_argument("--hub-url", default=DEFAULT_HUB, help="MCP hub base URL (loopback)")
+    parser.add_argument(
+        "--hub-url", default=DEFAULT_HUB, help="MCP backend: hub base URL (loopback)"
+    )
     parser.add_argument(
         "--token-file",
         default=DEFAULT_TOKEN_FILE,
-        help="file holding the hub token: the bare token, or VAR=value lines",
+        help="MCP backend: the hub token file, the bare token or VAR=value lines",
     )
     parser.add_argument(
         "--token-var",
@@ -157,7 +199,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--wait",
         type=float,
         default=50.0,
-        help="seconds one wait_for_events call may block (under the hub timeout)",
+        help="seconds one event wait may block (under the MCP hub's timeout)",
     )
     parser.add_argument(
         "--prefix",
@@ -169,8 +211,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         help="send the prefix's first character as this custom emoji (a document id)",
     )
-    parser.set_defaults(**file_values)
+    parser.set_defaults(**{k: v for k, v in file_values.items() if k not in LOGIN_KEYS})
     args = parser.parse_args(argv)
+    if args.backend not in BACKENDS:
+        raise ConfigError("--backend is telethon or mcp")
     if not ACCOUNT_NAME.fullmatch(args.account):
         raise ConfigError(
             "--account takes up to 32 lowercase letters, digits, - and _, "
@@ -186,6 +230,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         wait_seconds=min(max(1.0, float(args.wait)), 100.0),
         prefix=parse_prefix(args.prefix),
         custom_emoji_id=parse_custom_emoji_id(args.custom_emoji_id),
+        backend=args.backend,
+        session_file=session_path(args.session),
     )
 
 

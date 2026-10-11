@@ -2,9 +2,9 @@
 
 [Docs](README.md) / **MCP backend**
 
-The bridge talks to a [telegram-mcp](https://github.com/chigwell/telegram-mcp) server through an MCP hub over streamable HTTP (`mcp_http.py`): `initialize`, then `tools/list` and `tools/call`, each call an independent POST with the hub token as a bearer token, so a long-poll and a send run at the same time. Responses may be JSON or a server-sent-event stream. An expired session (HTTP 400 or 404) is re-initialized once; HTTP 401 or 403 is a configuration error.
+With `--backend mcp` (`mcp_backend.py`) the bridge talks to a [telegram-mcp](https://github.com/chigwell/telegram-mcp) server through an MCP hub over streamable HTTP (`mcp_http.py`): `initialize`, then `tools/list` and `tools/call`, each call an independent POST with the hub token as a bearer token, so a long-poll and a send run at the same time. Responses may be JSON or a server-sent-event stream. An expired session (HTTP 400 or 404) is re-initialized once; HTTP 401 or 403 is a configuration error.
 
-The endpoint is `<hub-url>/telegram-<account>/mcp`. At start the bridge checks that `tools/list` offers all three tools below and exits with status 2 naming the missing ones otherwise.
+The endpoint is `<hub-url>/telegram-<account>/mcp`. At start the bridge checks that `tools/list` offers all three tools below and exits with status 2 naming the missing ones otherwise. These tools come from a telegram-mcp fork with a per-message event log; upstream telegram-mcp does not offer `wait_for_events` and `get_messages_after` yet. Without such a server, use the Telethon backend.
 
 ## `get_messages_after`
 

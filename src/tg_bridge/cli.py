@@ -1,4 +1,4 @@
-"""Entry point: wire stdin/stdout to the bridge and keep the MCP connection up."""
+"""Entry point: wire stdin/stdout to the bridge and keep a backend connected."""
 
 from __future__ import annotations
 
@@ -11,9 +11,15 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from tg_bridge import account
+from tg_bridge.backend import Backend
 from tg_bridge.bridge import Bridge, Marker, short_reason
 from tg_bridge.config import Config, ConfigError, parse_args, read_token
-from tg_bridge.mcp_http import AuthError, McpHttpClient, ToolError, TransportError
+from tg_bridge.errors import AuthError, ToolError, TransportError
+from tg_bridge.mcp_backend import McpBackend
+from tg_bridge.mcp_http import McpHttpClient
+from tg_bridge.session import load_session
+from tg_bridge.telethon_backend import TelethonBackend
 
 log = logging.getLogger("tg_bridge")
 
@@ -46,11 +52,20 @@ async def read_stdin(bridge: Bridge) -> None:
         bridge.closed.set()
 
 
+def backend_factory(config: Config) -> Callable[[], Backend]:
+    """Check the backend's configuration once and return a factory that makes
+    a fresh connection for every attempt."""
+    if config.backend == "mcp":
+        token = read_token(config.token_file, config.token_var)
+        return lambda: McpBackend(McpHttpClient(config.mcp_url, token))
+    session = load_session(config.session_file)
+    return lambda: TelethonBackend(session)
+
+
 async def run(
     config: Config,
-    token: str,
+    make_backend: Callable[[], Backend],
     *,
-    client_factory: Callable[[str, str], Any] = McpHttpClient,
     stdin_reader: Callable[[Bridge], Awaitable[None]] = read_stdin,
     write: Callable[[dict[str, Any]], None] = write_stdout,
     backoff_start: float = 1.0,
@@ -79,10 +94,10 @@ async def run(
     backoff = backoff_start
     try:
         while not bridge.closed.is_set():
-            client = client_factory(config.mcp_url, token)
+            backend = make_backend()
             started = time.monotonic()
             try:
-                await bridge.serve(client)
+                await bridge.serve(backend)
                 if bridge.closed.is_set():
                     return 0
             except (ConfigError, AuthError) as exc:
@@ -90,12 +105,12 @@ async def run(
                 return EXIT_CONFIG
             except (TransportError, ToolError) as exc:
                 log.warning(
-                    "Telegram MCP connection failed (%s); retrying in %.0f s",
+                    "Telegram connection failed (%s); retrying in %.0f s",
                     short_reason(exc, 120),
                     backoff,
                 )
             finally:
-                await client.aclose()
+                await backend.aclose()
             if time.monotonic() - started >= STEADY_SECONDS:
                 backoff = backoff_start
             try:
@@ -118,13 +133,17 @@ def main(argv: list[str] | None = None) -> int:
     # httpx logs every request at INFO; a long-poll every 50 s would flood the hub's log.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    args = sys.argv[1:] if argv is None else argv
+    if args and args[0] in ("login", "chats"):
+        return account.main(args[0], args[1:])
     try:
-        config = parse_args(argv)
-        token = read_token(config.token_file, config.token_var)
+        config = parse_args(args)
+        make_backend = backend_factory(config)
     except ConfigError as exc:
         log.error("configuration error: %s", exc)
         return EXIT_CONFIG
-    return asyncio.run(run(config, token))
+    return asyncio.run(run(config, make_backend))
 
 
 if __name__ == "__main__":
