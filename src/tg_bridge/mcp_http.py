@@ -14,19 +14,9 @@ from typing import Any
 
 import httpx
 
+from tg_bridge.errors import AuthError, ToolError, TransportError
+
 PROTOCOL_VERSION = "2025-06-18"
-
-
-class TransportError(Exception):
-    """The hub or the Telegram server could not be reached or answered badly."""
-
-
-class AuthError(Exception):
-    """The hub refused the token (HTTP 401/403): a configuration error."""
-
-
-class ToolError(Exception):
-    """The tool ran and reported an error."""
 
 
 class McpHttpClient:

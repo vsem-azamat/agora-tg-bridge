@@ -204,8 +204,8 @@ def test_read_token(tmp_path):
 def test_bad_config_exits_2_without_printing_the_token(tmp_path, capsys):
     path = tmp_path / "tokens.env"
     path.write_text("MCP_HUB_TOKEN=supersecret\n")
-    assert main(["--chat", "nonsense", "--token-file", str(path)]) == 2
-    assert main(["--chat", "1", "--token-file", str(tmp_path / "absent")]) == 2
+    assert main(["--chat", "nonsense", "--backend", "mcp", "--token-file", str(path)]) == 2
+    assert main(["--chat", "1", "--backend", "mcp", "--token-file", str(tmp_path / "absent")]) == 2
     captured = capsys.readouterr()
     assert "supersecret" not in captured.out + captured.err
     assert captured.out == ""
@@ -214,7 +214,20 @@ def test_bad_config_exits_2_without_printing_the_token(tmp_path, capsys):
 # --- the reconnect loop ----------------------------------------------------
 
 from tests.test_bridge import CHAT, FakeTelegram, Out, hello, msg  # noqa: E402
-from tg_bridge.cli import run  # noqa: E402
+from tg_bridge.cli import backend_factory, run  # noqa: E402
+from tg_bridge.mcp_backend import McpBackend  # noqa: E402
+
+
+def test_mcp_backend_factory_reads_the_token_once(tmp_path):
+    path = tmp_path / "client.token"
+    path.write_text("tok\n")
+    config = parse_args(
+        ["--chat", "1", "--backend", "mcp", "--account", "work", "--token-file", str(path)]
+    )
+    make = backend_factory(config)
+    path.unlink()
+    backend = make()
+    assert backend._client._url == "http://127.0.0.1:8790/telegram-work/mcp"
 
 
 async def _drive(bridge, until):
@@ -237,9 +250,9 @@ async def test_run_reconnects_after_a_transport_error():
     clients = iter([broken, working])
     made = []
 
-    def factory(url, token):
-        made.append(url)
-        return next(clients)
+    def factory():
+        made.append(1)
+        return McpBackend(next(clients))
 
     async def reader(bridge):
         await _drive(bridge, lambda b: b.connected_at is not None)
@@ -248,8 +261,7 @@ async def test_run_reconnects_after_a_transport_error():
     code = await asyncio.wait_for(
         run(
             config,
-            "tok",
-            client_factory=factory,
+            factory,
             stdin_reader=reader,
             write=Out(),
             backoff_start=0.01,
@@ -259,7 +271,7 @@ async def test_run_reconnects_after_a_transport_error():
     )
 
     assert code == 0
-    assert len(made) == 2 and made[0].endswith("/telegram-personal/mcp")
+    assert len(made) == 2
     assert broken.closed and working.closed
 
 
@@ -279,8 +291,7 @@ async def test_run_sends_with_the_configured_prefix_and_custom_emoji():
     code = await asyncio.wait_for(
         run(
             config,
-            "tok",
-            client_factory=lambda u, t: tg,
+            lambda: McpBackend(tg),
             stdin_reader=reader,
             write=Out(),
             fresh_grace=0,
@@ -305,8 +316,7 @@ async def test_run_exits_2_on_a_configuration_error():
     code = await asyncio.wait_for(
         run(
             config,
-            "tok",
-            client_factory=lambda u, t: tg,
+            lambda: McpBackend(tg),
             stdin_reader=reader,
             write=Out(),
             fresh_grace=0,

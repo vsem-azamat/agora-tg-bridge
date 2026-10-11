@@ -1,11 +1,11 @@
-"""The bridge: Agora's JSON lines on one side, telegram-mcp tools on the other.
+"""The bridge: Agora's JSON lines on one side, a Telegram backend on the other.
 
-Inbound: after `hello`, read the chat from the hub's cursor (get_messages_after),
-then long-poll wait_for_events for this chat and read again whenever something
-arrives, plus a safety read every `reconcile_seconds`.
+Inbound: after `hello`, read the chat from the hub's cursor, then wait for
+events of this chat and read again whenever something arrives, plus a safety
+read every `reconcile_seconds`.
 
-Outbound: each `out` line becomes a send job of one or more send_message calls
-with the marker prefix in front. Before a job sends anything it looks in
+Outbound: each `out` line becomes a send job of one or more sends with the
+marker prefix in front. Before a job sends anything it looks in
 the chat for its text already delivered, but only in two cases: the job's own
 send got no answer (the connection broke or timed out), or the line came from
 the hub before `hello` or within 30 s of it (a message an earlier process sent
@@ -22,15 +22,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
+from tg_bridge.backend import Backend, History
 from tg_bridge.config import DEFAULT_PREFIX, ConfigError
-from tg_bridge.mcp_http import ToolError, TransportError
+from tg_bridge.errors import ChatAccessError, ToolError, TransportError
 from tg_bridge.render import in_line
 from tg_bridge.text import normalize, normalize_start, utf16_len
 
@@ -38,23 +38,12 @@ log = logging.getLogger("tg_bridge")
 
 ASSISTANT_ID = "assistant"
 MAX_MESSAGE_UTF16 = 4000  # Telegram allows 4096; leave room for the prefix
-REQUIRED_TOOLS = ("wait_for_events", "get_messages_after", "send_message")
 HISTORY_PAGE = 100
 DELIVERY_CHECK_PAGES = 10
-SEND_READ_TIMEOUT = 115.0  # Telethon may sleep through a 60 s flood wait; the hub allows 120 s
 FRESH_GRACE_SECONDS = 1.5  # the hub hands unanswered messages within a second of `hello`
 CLAIM_WINDOW_SECONDS = 30.0  # lines handed this soon after `hello` may be an earlier process's
 RECHECK_SECONDS = 65.0  # telegram-mcp may still be sleeping through a 60 s flood wait
 STARTUP_ATTEMPTS = 6
-_SENT_ID = re.compile(r"message_id=(\d+)")
-
-
-class McpClient(Protocol):
-    async def list_tools(self) -> list[str]: ...
-
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any], *, read_timeout: float = 60.0
-    ) -> str: ...
 
 
 def split_message(text: str, limit: int = MAX_MESSAGE_UTF16) -> list[str]:
@@ -103,10 +92,12 @@ class Marker:
         # telegram-mcp strips invisible characters and leading whitespace,
         # but keeps the space after the prefix.
         text = normalize(str(rec.get("text") or ""))
-        if not text.startswith(normalize_start(self.prefix)):
-            return False
         if self.custom_emoji_id is None:
-            return True
+            return text.startswith(normalize_start(self.prefix))
+        # The custom emoji is the mark: other assistants may follow it with
+        # other text than this bridge's prefix.
+        if not text.startswith(normalize_start(self.prefix)[:1]):
+            return False
         return any(
             isinstance(e, dict) and str(e.get("id")) == self.custom_emoji_id
             for e in rec.get("custom_emojis") or []
@@ -169,14 +160,12 @@ class Bridge:
         self.outbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.chat_id: int | None = None
         self.chat_type: str | None = None
-        self.boot: str | None = None
-        self.after_seq = 0
         self._own_order: deque[int] = deque(maxlen=5000)
         self._own: set[int] = set()
         self._accepted: set[int] = set()  # out ids taken in this process
         self._job: SendJob | None = None
         self._lock = asyncio.Lock()
-        self._client: McpClient | None = None
+        self._backend: Backend | None = None
         self._in_flight: asyncio.Future | None = None
         self._started_once = False
         self._startup_failures = 0
@@ -232,21 +221,9 @@ class Bridge:
 
     # --- Telegram side: reading -------------------------------------------
 
-    async def _messages_after(self, after_id: int | None, limit: int) -> dict[str, Any]:
-        args: dict[str, Any] = {
-            "chat_id": self.chat_id if self.chat_id is not None else self.chat,
-            "limit": limit,
-        }
-        if after_id is not None:
-            args["after_id"] = after_id
-        text = await self._client.call_tool("get_messages_after", args, read_timeout=60.0)
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError:
-            raise ToolError(short_reason(text)) from None
-        if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
-            raise ToolError("unexpected get_messages_after result")
-        return result
+    async def _messages_after(self, after_id: int | None, limit: int) -> History:
+        chat = self.chat_id if self.chat_id is not None else self.chat
+        return await self._backend.messages_after(chat, after_id, limit)
 
     def _line_for(self, rec: dict[str, Any]) -> dict[str, Any]:
         if rec["id"] in self._own:
@@ -268,7 +245,7 @@ class Bridge:
         emitted = 0
         while True:
             result = await self._messages_after(self.cursor or 0, HISTORY_PAGE)
-            records = [r for r in result["messages"] if isinstance(r.get("id"), int)]
+            records = [r for r in result.messages if isinstance(r.get("id"), int)]
             for rec in records:
                 if self.cursor is not None and rec["id"] <= self.cursor:
                     continue
@@ -276,30 +253,14 @@ class Bridge:
                 self.emit(line)
                 emitted += "id" in line
                 self.cursor = rec["id"]
-            if not result.get("has_more") or not records:
+            if not result.has_more or not records:
                 break
         if emitted:
             log.info("read %d new message(s), cursor %s", emitted, self.cursor)
         return emitted
 
     async def _poll_events(self, timeout: float) -> bool:
-        args: dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "after_seq": self.after_seq,
-            "timeout": timeout,
-        }
-        if self.boot:
-            args["boot"] = self.boot
-        text = await self._client.call_tool("wait_for_events", args, read_timeout=timeout + 30.0)
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError:
-            raise ToolError(short_reason(text)) from None
-        if result.get("reset") and self.boot is not None:
-            log.info("telegram-mcp restarted; reading the chat again")
-        self.boot = result.get("boot") or self.boot
-        self.after_seq = int(result.get("last_seq") or 0)
-        return bool(result.get("events") or result.get("gap") or result.get("reset"))
+        return await self._backend.wait_for_events(self.chat_id, timeout)
 
     # --- Telegram side: sending -------------------------------------------
 
@@ -313,7 +274,7 @@ class Bridge:
             if job.done >= len(job.chunks):
                 break
             result = await self._messages_after(after, HISTORY_PAGE)
-            records = [r for r in result["messages"] if isinstance(r.get("id"), int)]
+            records = [r for r in result.messages if isinstance(r.get("id"), int)]
             for rec in records:
                 after = max(after, rec["id"])
                 if job.done >= len(job.chunks):
@@ -331,7 +292,7 @@ class Bridge:
                 self._remember_own(rec["id"])
                 job.done += 1
                 found += 1
-            if not result.get("has_more") or not records:
+            if not result.has_more or not records:
                 break
         if found:
             log.info("message %s: %d part(s) already in the chat", job.out_id, found)
@@ -381,17 +342,12 @@ class Bridge:
             job.claim_from = None
             job.uncertain = False
         while job.done < len(job.chunks):
-            args: dict[str, Any] = {
-                "chat_id": self.chat_id,
-                "message": self.marker.text(job.chunks[job.done]),
-            }
-            if self.marker.custom_emoji_id is not None:
-                args["custom_emoji_id"] = self.marker.custom_emoji_id
-            if job.reply_to is not None and job.done == 0:
-                args["reply_to"] = job.reply_to
             try:
-                result = await self._client.call_tool(
-                    "send_message", args, read_timeout=SEND_READ_TIMEOUT
+                msg_id = await self._backend.send(
+                    self.chat_id,
+                    self.marker.text(job.chunks[job.done]),
+                    reply_to=job.reply_to if job.done == 0 else None,
+                    custom_emoji_id=self.marker.custom_emoji_id,
                 )
             except (TransportError, asyncio.CancelledError):
                 job.uncertain = True
@@ -399,14 +355,11 @@ class Bridge:
                 log.warning("message %s: no answer to a send; will check the chat", job.out_id)
                 raise
             except ToolError as exc:
-                result = str(exc)
-            if not result.startswith("Message sent successfully"):
-                self._finish_failed(job, short_reason(result))
+                self._finish_failed(job, short_reason(exc))
                 return
-            match = _SENT_ID.search(result)
-            if match:
-                job.ids.append(int(match.group(1)))
-                self._remember_own(job.ids[-1])
+            if msg_id is not None:
+                job.ids.append(msg_id)
+                self._remember_own(msg_id)
             job.done += 1
         self._finish_sent(job)
 
@@ -470,19 +423,19 @@ class Bridge:
     async def _resolve_chat(self) -> None:
         try:
             first = await self._messages_after(None, 1)
+        except ChatAccessError as exc:
+            raise ConfigError(f"cannot read the chat: {exc}") from exc
         except ToolError as exc:
-            if "restricted" in str(exc).lower():
-                raise ConfigError(f"cannot read the chat: {exc}") from exc
             self._startup_failures += 1
             if self._startup_failures >= STARTUP_ATTEMPTS:
                 raise ConfigError(f"cannot read the chat: {exc}") from exc
             raise
         self._startup_failures = 0
-        self.chat_id = int(first["chat_id"])
-        self.chat_type = str(first.get("chat_type") or "")
+        self.chat_id = first.chat_id
+        self.chat_type = first.chat_type
         log.info("chat %s (%s)", self.chat_id, self.chat_type)
         if self.cursor is None:
-            newest = first["messages"][-1]["id"] if first["messages"] else 0
+            newest = first.messages[-1]["id"] if first.messages else 0
             self.cursor = int(newest)
             self.hello_cursor = self.cursor
             if newest:
@@ -490,14 +443,7 @@ class Bridge:
             log.info("no cursor: starting after message %s", newest)
 
     async def _startup(self) -> None:
-        tools = await self._client.list_tools()
-        missing = [name for name in REQUIRED_TOOLS if name not in tools]
-        if missing:
-            raise ConfigError(
-                "the Telegram MCP endpoint does not offer "
-                + ", ".join(missing)
-                + " (telegram-mcp with the event log, and the hub's tool filter)"
-            )
+        await self._backend.start()
         if self.chat_id is None:
             await self._resolve_chat()
         # Learn the event log's position before reading, so nothing that
@@ -529,11 +475,11 @@ class Bridge:
         ):
             log.info("previous send ended with %s", type(results[0]).__name__)
 
-    async def serve(self, client: McpClient) -> None:
-        """Run with one MCP connection until stdin closes; transport errors
+    async def serve(self, backend: Backend) -> None:
+        """Run with one backend connection until stdin closes; transport errors
         propagate so the caller reconnects with backoff."""
         await self._settle_in_flight(None)
-        self._client = client
+        self._backend = backend
         hello = asyncio.ensure_future(self.hello_seen.wait())
         closed = asyncio.ensure_future(self.closed.wait())
         await asyncio.wait({hello, closed}, return_when=asyncio.FIRST_COMPLETED)

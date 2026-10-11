@@ -9,13 +9,13 @@ from typing import Any
 import pytest
 
 from tg_bridge.bridge import (
-    SEND_READ_TIMEOUT,
     Bridge,
     Marker,
     split_message,
 )
 from tg_bridge.config import ROBOT, ConfigError
-from tg_bridge.mcp_http import ToolError, TransportError
+from tg_bridge.errors import ToolError, TransportError
+from tg_bridge.mcp_backend import SEND_READ_TIMEOUT, McpBackend
 from tg_bridge.text import normalize, utf16_len
 
 CHAT = -1001234567890
@@ -169,7 +169,7 @@ async def started(
     bridge.connected_at = None
     if bridge.hello is None:
         bridge.handle_hub_line(hello(cursor))
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     for _ in range(100):
         await asyncio.sleep(0.01)
         if bridge.connected_at is not None:
@@ -437,7 +437,7 @@ async def test_claim_requires_the_same_reply_to():
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
     bridge.handle_hub_line(hello("10"))
     bridge.handle_hub_line(out_line(318, "hello", reply_to="10"))  # 11 replies to nothing
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await settle()
 
     assert tg.sends == 1
@@ -452,7 +452,7 @@ async def test_message_handed_after_the_first_read_is_still_claimed():
     out = Out()
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
     bridge.handle_hub_line(hello("10"))
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await settle()
     assert [line["id"] for line in out.of("in") if "id" in line] == ["11"]  # imported
 
@@ -475,7 +475,7 @@ async def test_uncertain_send_is_checked_again_after_a_flood_wait():
     with pytest.raises(TransportError):
         await asyncio.wait_for(task, 2)
     tg.send_error = None
-    task2 = asyncio.create_task(bridge.serve(tg))
+    task2 = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await asyncio.sleep(0.1)
     assert not out.of("failed") and not out.of("sent")  # still waiting
     tg.history.append(robot(1500, f"{ROBOT} late"))
@@ -511,7 +511,7 @@ async def test_fresh_process_claims_a_message_delivered_before_a_crash():
     out = Out()
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0.05)
     bridge.handle_hub_line(hello("10"))
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await asyncio.sleep(0.01)
     bridge.handle_hub_line(out_line(318, "hello"))  # handed again after the restart
     await settle()
@@ -533,7 +533,7 @@ async def test_fresh_process_claims_every_part_of_a_split_message():
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0.05)
     bridge.handle_hub_line(hello("10"))
     bridge.handle_hub_line(out_line(2, text))
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await settle()
 
     assert out.of("sent") == [{"type": "sent", "id": 2, "ext_id": "11"}]
@@ -554,6 +554,18 @@ async def test_assistant_messages_through_the_account_are_not_the_operators():
     assert other["author"] == {"id": "assistant", "name": f"assistant ({ROBOT})", "self": False}
     assert other["addressed"] is False
     assert me["author"]["self"] is True
+    await stop(bridge, task)
+
+
+async def test_with_a_custom_emoji_any_text_after_it_marks_an_assistant():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10")
+
+    tg.arrive(robot(11, f"{ROBOT}\nanother assistant"))
+    await settle()
+
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert line["author"]["id"] == "assistant"
     await stop(bridge, task)
 
 
@@ -607,7 +619,7 @@ async def test_an_early_message_is_not_claimed_from_an_own_message_without_the_c
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
     bridge.handle_hub_line(hello("10"))
     bridge.handle_hub_line(out_line(318, "hello"))
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await settle()
 
     assert tg.sends == 1
@@ -684,7 +696,7 @@ async def test_temporary_failure_at_start_is_retried_not_fatal():
     bridge.handle_hub_line(hello("10"))
 
     with pytest.raises(ToolError) as info:
-        await bridge.serve(tg)
+        await bridge.serve(McpBackend(tg))
     assert not isinstance(info.value, ConfigError)
 
     _, _, task = await started(tg, bridge=bridge)  # the reconnect succeeds
@@ -700,9 +712,9 @@ async def test_persistent_failure_at_start_becomes_a_configuration_error():
 
     for _ in range(5):
         with pytest.raises(ToolError):
-            await bridge.serve(tg)
+            await bridge.serve(McpBackend(tg))
     with pytest.raises(ConfigError):
-        await bridge.serve(tg)
+        await bridge.serve(McpBackend(tg))
 
 
 async def test_out_lines_wait_for_the_connection():
@@ -711,7 +723,7 @@ async def test_out_lines_wait_for_the_connection():
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
     bridge.handle_hub_line(json.dumps({"type": "out", "id": 1, "author": "a", "text": "early"}))
     bridge.handle_hub_line(hello("10"))
-    task = asyncio.create_task(bridge.serve(tg))
+    task = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await settle()
 
     assert out.of("sent") == [{"type": "sent", "id": 1, "ext_id": "1001"}]
@@ -747,7 +759,7 @@ async def test_missing_event_tools_is_a_configuration_error():
     bridge.handle_hub_line(hello())
 
     with pytest.raises(ConfigError):
-        await bridge.serve(tg)
+        await bridge.serve(McpBackend(tg))
 
 
 async def test_restricted_chat_is_a_configuration_error():
@@ -757,7 +769,7 @@ async def test_restricted_chat_is_a_configuration_error():
     bridge.handle_hub_line(hello())
 
     with pytest.raises(ConfigError):
-        await bridge.serve(tg)
+        await bridge.serve(McpBackend(tg))
 
 
 async def test_unknown_lines_are_ignored():
@@ -771,7 +783,7 @@ async def test_unknown_lines_are_ignored():
 async def test_stdin_closing_before_hello_returns():
     bridge = Bridge(CHAT, Out())
     bridge.closed.set()
-    await asyncio.wait_for(bridge.serve(FakeTelegram()), 1)
+    await asyncio.wait_for(bridge.serve(McpBackend(FakeTelegram())), 1)
 
 
 def test_split_message_respects_utf16_limit():
