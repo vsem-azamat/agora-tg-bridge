@@ -34,6 +34,7 @@ class Record(TypedDict, total=False):
     transcript: str  # a machine transcript of a voice message
     action: str  # set on service messages
     custom_emojis: list[dict[str, str]]  # [{"id": document id, …}]
+    sender_photo: str  # the sender's profile photo by an opaque id, "" for none (Telethon only)
 
 
 @dataclass(frozen=True)
@@ -67,5 +68,9 @@ class Backend(Protocol):
     ) -> int | None:
         """Send plain text, the first character as the custom emoji when given;
         returns the new message id when known."""
+
+    async def profile_photo(self, sender_id: int) -> bytes | None:
+        """The small profile photo of a sender seen in the chat, None when it has
+        none. Asked only for records that carry `sender_photo`."""
 
     async def aclose(self) -> None: ...

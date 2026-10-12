@@ -18,7 +18,7 @@ Messages of the chat with an id above `after_id`, oldest first; without `after_i
                "text": "…", "out": false, "addressed": true, "reply_to": 5510}]}
 ```
 
-`chat_type` is `private`, `group`, `supergroup` or `channel`. A record may also carry `media` (`photo`, `voice`, `video_note`, `video`, `audio`, `gif`, `document: <name>`, `sticker <alt>`, `contact`, `geo`, `poll`), `duration`, `poll.question`, `forwarded` (`from_user`, `from_chat` or `from_name`), `transcript`, `action` (a service message) and `custom_emojis` (`[{"emoji": "🤖", "id": "…"}]`).
+`chat_type` is `private`, `group`, `supergroup` or `channel`. A record may also carry `media` (`photo`, `voice`, `video_note`, `video`, `audio`, `gif`, `document: <name>`, `sticker <alt>`, `contact`, `geo`, `poll`), `duration`, `poll.question`, `forwarded` (`from_user`, `from_chat` or `from_name`), `transcript`, `action` (a service message) and `custom_emojis` (`[{"emoji": "🤖", "id": "…"}]`). telegram-mcp offers no profile photos, so records carry no `sender_photo` and this backend sends no avatars.
 
 ## `wait_for_events`
 

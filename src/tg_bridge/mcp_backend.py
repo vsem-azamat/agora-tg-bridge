@@ -120,3 +120,7 @@ class McpBackend:
             raise ToolError(_short(result))
         match = _SENT_ID.search(result)
         return int(match.group(1)) if match else None
+
+    async def profile_photo(self, sender_id: int) -> bytes | None:
+        # telegram-mcp's records carry no sender_photo, so the bridge never asks.
+        raise ToolError("telegram-mcp offers no profile photos")

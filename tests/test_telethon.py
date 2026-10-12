@@ -7,6 +7,7 @@ tested against Telethon's own properties (voice, sticker, file, forward…).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import stat
 from datetime import UTC, datetime
@@ -20,7 +21,7 @@ from telethon.errors.common import AuthKeyNotFound
 from telethon.tl import patched, types
 
 from tests.test_bridge import Out, hello, out_line, settle
-from tg_bridge.bridge import Bridge, Marker
+from tg_bridge.bridge import AVATAR_LINES, Bridge, Marker
 from tg_bridge.cli import main, run
 from tg_bridge.config import ROBOT, ConfigError, parse_args
 from tg_bridge.errors import AuthError, ChatAccessError, ToolError, TransportError
@@ -95,6 +96,7 @@ def test_text_message_record():
         "text": "hello",
         "reply_to": 10,
         "addressed": True,
+        "sender_photo": "",
     }
 
 
@@ -232,6 +234,9 @@ class FakeClient:
         self.deliver_despite_error = False
         self.send_delay = 0.0
         self.read_error: BaseException | None = None
+        self.photos: dict[int, bytes] = {}
+        self.photo_error: BaseException | None = None
+        self.downloads: list[tuple[Any, Any, bool]] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -266,6 +271,14 @@ class FakeClient:
         if reverse:
             return [m for m in self.history if m.id > min_id][:limit]
         return list(reversed(self.history[-limit:]))
+
+    async def download_profile_photo(
+        self, entity: Any, file: Any = None, download_big: bool = True
+    ) -> Any:
+        self.downloads.append((entity, file, download_big))
+        if self.photo_error:
+            raise self.photo_error
+        return self.photos.get(entity if isinstance(entity, int) else entity.id)
 
     async def arrive(self, msg: Any) -> None:
         self.history.append(msg)
@@ -441,7 +454,12 @@ async def test_bridge_reads_sends_and_skips_its_echo():
     await client.arrive(tg_msg(11, "question", mentioned=True))
     await settle()
     (line,) = [line for line in out.of("in") if "id" in line]
-    assert line["author"] == {"id": "42", "name": "Ada Lovelace", "self": False}
+    assert line["author"] == {
+        "id": "42",
+        "name": "Ada Lovelace",
+        "self": False,
+        "avatar_rev": "none",
+    }
     assert line["addressed"] is True and line["text"] == "question"
 
     bridge.handle_hub_line(out_line(318, "answer", reply_to="11"))
@@ -565,3 +583,160 @@ async def test_login_saves_the_session(tmp_path):
     )
     assert name == "Operator"
     assert load_session(path) == SessionData(12345, "0123456789abcdef", "1BBBB")
+
+
+# --- avatars -----------------------------------------------------------------
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+GRACE = types.User(id=43, first_name="Grace", photo=types.UserProfilePhoto(photo_id=777, dc_id=2))
+
+
+def test_record_names_the_senders_photo():
+    assert to_record(tg_msg(11, sender=GRACE), "group")["sender_photo"] == "777"
+    assert to_record(tg_msg(12), "group")["sender_photo"] == ""
+    assert "sender_photo" not in to_record(tg_msg(13, sender=None), "group")
+
+
+async def test_profile_photo_is_downloaded_small_through_the_seen_sender():
+    client = FakeClient([tg_msg(10, sender=GRACE)])
+    client.photos[GRACE.id] = JPEG
+    backend = backend_for(client)
+    await backend.start()
+    await backend.messages_after(CHAT, 0, 10)
+
+    assert await backend.profile_photo(GRACE.id) == JPEG
+    assert client.downloads == [(GRACE, bytes, False)]
+    assert await backend.profile_photo(ADA.id) is None  # not seen: asked by id, has none
+    assert client.downloads[-1][0] == ADA.id
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ValueError("Could not find the input entity"), ToolError),
+        (rpc_error(400, "PEER_ID_INVALID"), ToolError),
+        (ConnectionError("reset"), TransportError),
+    ],
+)
+async def test_profile_photo_errors_are_sorted(error, expected):
+    client = FakeClient()
+    client.photo_error = error
+    backend = backend_for(client)
+    await backend.start()
+    with pytest.raises(expected):
+        await backend.profile_photo(GRACE.id)
+
+
+async def _avatar_bridge(client: FakeClient, **kw: Any) -> tuple[Bridge, Out, asyncio.Task]:
+    out = Out()
+    bridge = Bridge(
+        CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER, **kw
+    )
+    bridge.handle_hub_line(hello("10"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    return bridge, out, task
+
+
+async def test_a_senders_avatar_goes_to_the_hub_once_per_photo():
+    client = FakeClient([tg_msg(10)])
+    client.photos[GRACE.id] = JPEG
+    bridge, out, task = await _avatar_bridge(client)
+
+    await client.arrive(tg_msg(11, sender=GRACE))
+    await settle()
+    await client.arrive(tg_msg(12, sender=GRACE))  # after its avatar went out
+    await client.arrive(tg_msg(13))  # Ada has no photo
+    await settle()
+
+    ins = [line for line in out.of("in") if "id" in line]
+    assert [line["author"]["avatar_rev"] for line in ins] == ["777", "777", "none"]
+    assert out.of("avatar") == [
+        {
+            "type": "avatar",
+            "author": "43",
+            "mime": "image/jpeg",
+            "data": base64.b64encode(JPEG).decode(),
+            "rev": "777",
+        },
+        {"type": "avatar", "author": "42", "data": "", "rev": "none"},
+    ]
+
+    changed = types.User(
+        id=43, first_name="Grace", photo=types.UserProfilePhoto(photo_id=778, dc_id=2)
+    )
+    await client.arrive(tg_msg(14, sender=changed))
+    await settle()
+    assert [line["rev"] for line in out.of("avatar")] == ["777", "none", "778"]
+    await stop_bridge(bridge, task)
+
+
+async def test_own_and_assistant_messages_carry_no_avatar():
+    me = types.User(
+        id=SELF_ID,
+        first_name="Operator",
+        is_self=True,
+        photo=types.UserProfilePhoto(photo_id=5, dc_id=2),
+    )
+    client = FakeClient([tg_msg(10)])
+    bridge, out, task = await _avatar_bridge(client)
+
+    mark = types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))
+    await client.arrive(tg_msg(11, "from my phone", sender=me, out=True))
+    await client.arrive(tg_msg(12, f"{ROBOT} an assistant", sender=me, out=True, entities=[mark]))
+    await settle()
+
+    ins = [line for line in out.of("in") if "id" in line]
+    assert len(ins) == 2 and all("avatar_rev" not in line["author"] for line in ins)
+    assert out.of("avatar") == [] and client.downloads == []
+    await stop_bridge(bridge, task)
+
+
+async def test_an_unreadable_or_odd_photo_is_skipped_until_it_changes(caplog):
+    client = FakeClient([tg_msg(10)])
+    client.photo_error = rpc_error(400, "PEER_ID_INVALID")
+    bridge, out, task = await _avatar_bridge(client)
+
+    await client.arrive(tg_msg(11, sender=GRACE))
+    await settle()
+    await client.arrive(tg_msg(12, sender=GRACE))
+    await settle()
+    assert out.of("avatar") == [] and len(client.downloads) == 1
+    assert "avatar of 43 not read" in caplog.text
+
+    client.photo_error = None
+    client.photos[GRACE.id] = b"GIF89a"
+    gif = types.User(id=43, first_name="Grace", photo=types.UserProfilePhoto(photo_id=779, dc_id=2))
+    await client.arrive(tg_msg(13, sender=gif))
+    await settle()
+    assert out.of("avatar") == [] and len(client.downloads) == 2
+    assert "not JPEG or PNG" in caplog.text
+    await stop_bridge(bridge, task)
+
+
+async def test_avatar_lines_keep_within_the_hubs_rate():
+    people = [
+        types.User(
+            id=100 + i, first_name=f"P{i}", photo=types.UserProfilePhoto(photo_id=i, dc_id=2)
+        )
+        for i in range(AVATAR_LINES + 1)
+    ]
+    client = FakeClient([tg_msg(10)])
+    for person in people:
+        client.photos[person.id] = JPEG
+    bridge, out, task = await _avatar_bridge(client, avatar_window=0.5)
+
+    for i, person in enumerate(people):
+        await client.arrive(tg_msg(11 + i, sender=person))
+    await settle()
+    assert len(out.of("avatar")) == AVATAR_LINES
+
+    await asyncio.sleep(0.6)
+    assert len(out.of("avatar")) == AVATAR_LINES + 1
+    await stop_bridge(bridge, task)
+
+
+async def stop_bridge(bridge: Bridge, task: asyncio.Task) -> None:
+    bridge.closed.set()
+    await asyncio.wait_for(task, 2)
