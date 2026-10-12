@@ -21,8 +21,12 @@ The bridge loads the session into memory (a `StringSession`) and never writes th
 ## Reading and events
 
 - **Chat.** The chat is resolved once per connection with `get_entity`; an id not in the session's cache yet is looked up in the dialog list once, and an id the account does not have is a configuration error. The chat type comes from the entity: a user is `private`, a basic group `group`, a megagroup `supergroup`, a broadcast channel `channel`.
-- **History.** `get_messages` with `min_id` and `reverse` reads the messages after an id, oldest first; without an id it reads the newest ones. Each message becomes the same record the MCP backend returns ([MCP backend](mcp-backend.md#get_messages_after)): sender, date in UTC, text cleaned as telegram-mcp cleans it (`text.normalize`: invisible and format characters removed, runs of blank lines collapsed), `reply_to`, `media` (a link preview is not media), `duration` for voice and video messages, the poll question, the forward's origin, custom emoji ids, and `addressed` (private chat: every message except own ones; group: Telegram's mention flag; channel: never). Service messages carry only their action and move the cursor.
+- **History.** `get_messages` with `min_id` and `reverse` reads the messages after an id, oldest first; without an id it reads the newest ones. Each message becomes the same record the MCP backend returns ([MCP backend](mcp-backend.md#get_messages_after)): sender, date in UTC, text cleaned as telegram-mcp cleans it (`text.normalize`: invisible and format characters removed, runs of blank lines collapsed), `reply_to`, `media` (a link preview is not media), `duration` for voice and video messages, the poll question, the forward's origin, custom emoji ids, `sender_photo` (the id of the sender's profile photo, empty when there is none or it is hidden), and `addressed` (private chat: every message except own ones; group: Telegram's mention flag; channel: never). Service messages carry only their action and move the cursor.
 - **Events.** A `NewMessage` handler wakes the bridge for every new message of the chat, incoming or the account's own from another device. The bridge then reads the chat; the safety read every `--reconcile` seconds covers updates Telegram did not deliver.
+
+## Profile photos
+
+The backend keeps the last 2000 senders it read (`SENDERS_KEPT`) and downloads a sender's small profile photo through that entity (`download_profile_photo`, `download_big=False`), so senders Telegram sends only as min users work too. A sender no longer kept is asked for by id; one Telethon cannot find is a refusal, like Telegram's own errors.
 
 ## Sending
 

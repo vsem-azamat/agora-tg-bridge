@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from datetime import UTC
 from typing import Any
@@ -33,6 +34,7 @@ SEND_TIMEOUT = 115.0  # longer than a flood wait Telethon sleeps through
 REQUEST_TIMEOUT = 60.0
 DIALOGS_TIMEOUT = 300.0  # the whole dialog list of a big account takes a while
 DEVICE_MODEL = "agora-tg-bridge"
+SENDERS_KEPT = 2000  # senders whose profile photo may be asked for
 
 # Errors that mean the account may not read or write the chat.
 ACCESS_ERRORS: tuple[type[Exception], ...] = (
@@ -127,6 +129,15 @@ def _poll_question(msg: Any) -> str:
     return getattr(question, "text", question) or ""
 
 
+def photo_rev(entity: Any) -> str:
+    """The id of a user's or chat's current profile photo, "" when it has none
+    (or hides it)."""
+    photo = getattr(entity, "photo", None)
+    if isinstance(photo, (types.UserProfilePhoto, types.ChatPhoto)):
+        return str(photo.photo_id)
+    return ""
+
+
 def _iso(value: Any) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
@@ -161,6 +172,8 @@ def to_record(msg: Any, kind: str) -> Record:
     if isinstance(msg, types.MessageService):
         rec["action"] = type(msg.action).__name__
         return rec  # a service message only moves the cursor
+    if msg.sender is not None:
+        rec["sender_photo"] = photo_rev(msg.sender)
     text = normalize(msg.message or "")  # as telegram-mcp cleans it
     if text:
         rec["text"] = text
@@ -206,6 +219,9 @@ class TelethonBackend:
         self._chat_id: int | None = None
         self._chat_type = ""
         self._woken = asyncio.Event()
+        # The senders read in the chat, newest last: their photos are
+        # downloaded through these, which also works for min users.
+        self._senders: OrderedDict[int, Any] = OrderedDict()
 
     async def start(self) -> None:
         with telegram_errors("connect"):
@@ -266,12 +282,34 @@ class TelethonBackend:
                     )
                 )
         messages = [m for m in found if isinstance(m, types.Message | types.MessageService)]
+        for m in messages:
+            if m.sender is not None and m.sender_id is not None:
+                self._remember_sender(m.sender_id, m.sender)
         return History(
             chat_id=self._chat_id,
             chat_type=self._chat_type,
             messages=[to_record(m, self._chat_type) for m in messages],
             has_more=len(found) >= limit,
         )
+
+    def _remember_sender(self, sender_id: int, entity: Any) -> None:
+        self._senders[sender_id] = entity
+        self._senders.move_to_end(sender_id)
+        if len(self._senders) > SENDERS_KEPT:
+            self._senders.popitem(last=False)
+
+    async def profile_photo(self, sender_id: int) -> bytes | None:
+        self._check_connected()
+        entity = self._senders.get(sender_id, sender_id)
+        with telegram_errors("download a profile photo"):
+            try:
+                data = await asyncio.wait_for(
+                    self._client.download_profile_photo(entity, file=bytes, download_big=False),
+                    REQUEST_TIMEOUT,
+                )
+            except ValueError:  # not in the session's cache any more
+                raise ToolError("download a profile photo: unknown sender") from None
+        return data or None
 
     async def wait_for_events(self, chat_id: int, timeout: float) -> bool:
         self._check_connected()
