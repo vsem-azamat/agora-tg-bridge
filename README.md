@@ -95,7 +95,7 @@ The bridge exits with status 2 on a configuration error (no session or a revoked
 ## Limits
 
 - Edits, deletions and reactions are not bridged (the protocol has no lines for them).
-- Media arrive as placeholders such as `[photo]` or `[voice 0:12]`; nothing is downloaded but the senders' small profile photos (Telethon backend only), which Agora shows as their avatars.
+- Media arrive as placeholders such as `[photo]` or `[voice 0:12]`; nothing is downloaded but the senders' small profile photos (with the MCP backend only when telegram-mcp offers `get_profile_photo`), which Agora shows as their avatars.
 - See [docs/architecture.md](docs/architecture.md) for the delivery guarantees and their limits.
 
 ## Development

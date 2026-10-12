@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import re
@@ -14,6 +16,7 @@ from tg_bridge.errors import ChatAccessError, ToolError
 log = logging.getLogger("tg_bridge")
 
 REQUIRED_TOOLS = ("wait_for_events", "get_messages_after", "send_message")
+PHOTO_TOOL = "get_profile_photo"  # optional: without it the bridge sends no avatars
 READ_TIMEOUT = 60.0
 WAIT_SLACK = 30.0  # the HTTP read may last this much longer than the wait itself
 SEND_READ_TIMEOUT = 115.0  # Telethon may sleep through a 60 s flood wait; the hub allows 120 s
@@ -40,6 +43,7 @@ class McpBackend:
         self._client = client
         self._boot: str | None = None
         self._after_seq = 0
+        self._photos = False  # the endpoint offers PHOTO_TOOL
 
     async def start(self) -> None:
         tools = await self._client.list_tools()
@@ -50,6 +54,9 @@ class McpBackend:
                 + ", ".join(missing)
                 + " (telegram-mcp with the event log, and the hub's tool filter)"
             )
+        self._photos = PHOTO_TOOL in tools
+        if not self._photos:
+            log.info("the endpoint does not offer %s: no avatars", PHOTO_TOOL)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -74,11 +81,16 @@ class McpBackend:
             raise ToolError(_short(text)) from None
         if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
             raise ToolError("unexpected get_messages_after result")
+        messages = [r for r in result["messages"] if isinstance(r, dict)]
+        if not self._photos:
+            # A photo id the bridge cannot fetch would only drop stored avatars.
+            for rec in messages:
+                rec.pop("sender_photo", None)
         try:
             return History(
                 chat_id=int(result["chat_id"]),
                 chat_type=str(result.get("chat_type") or ""),
-                messages=[r for r in result["messages"] if isinstance(r, dict)],
+                messages=messages,
                 has_more=bool(result.get("has_more")),
             )
         except (KeyError, TypeError, ValueError):
@@ -122,5 +134,20 @@ class McpBackend:
         return int(match.group(1)) if match else None
 
     async def profile_photo(self, sender_id: int) -> bytes | None:
-        # telegram-mcp's records carry no sender_photo, so the bridge never asks.
-        raise ToolError("telegram-mcp offers no profile photos")
+        text = await self._client.call_tool(
+            PHOTO_TOOL, {"peer_id": sender_id}, read_timeout=READ_TIMEOUT
+        )
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            raise ToolError(_short(text)) from None
+        if not isinstance(result, dict) or result.get("peer_id") != sender_id:
+            raise ToolError(f"unexpected {PHOTO_TOOL} result")
+        if result.get("photo_id") == "":
+            return None
+        if not result.get("data"):
+            raise ToolError(f"{PHOTO_TOOL} gave no picture")
+        try:
+            return base64.b64decode(str(result["data"]), validate=True)
+        except (binascii.Error, ValueError):
+            raise ToolError(f"unexpected {PHOTO_TOOL} result") from None
