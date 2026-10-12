@@ -802,6 +802,21 @@ async def test_a_download_without_an_answer_is_tried_again_on_the_same_connectio
     await stop_bridge(bridge, task)
 
 
+async def test_a_download_without_an_answer_goes_to_the_back_of_the_queue():
+    client = FakeClient([tg_msg(10)])
+    client.photos[GRACE.id] = JPEG
+    client.photos[44] = JPEG
+    client.photo_errors = [ConnectionError("reset")]
+    bridge, out, task = await _avatar_bridge(client, avatar_retry=0.05)
+
+    await client.arrive(tg_msg(11, sender=GRACE))
+    await client.arrive(tg_msg(12, sender=person(44, 9)))
+    await settle()
+
+    assert [line["author"] for line in out.of("avatar")] == ["44", "43"]
+    await stop_bridge(bridge, task)
+
+
 async def test_avatars_still_waiting_are_sent_after_a_reconnect():
     people = [person(100 + i, i) for i in range(AVATAR_LINES + 1)]
     client = FakeClient([tg_msg(10)])
