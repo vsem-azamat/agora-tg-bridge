@@ -21,7 +21,7 @@ from telethon.errors.common import AuthKeyNotFound
 from telethon.tl import patched, types
 
 from tests.test_bridge import Out, hello, out_line, settle
-from tg_bridge.bridge import AVATAR_LINES, Bridge, Marker
+from tg_bridge.bridge import AVATAR_LINES, MAX_AVATAR_BYTES, Bridge, Marker
 from tg_bridge.cli import main, run
 from tg_bridge.config import ROBOT, ConfigError, parse_args
 from tg_bridge.errors import AuthError, ChatAccessError, ToolError, TransportError
@@ -236,6 +236,8 @@ class FakeClient:
         self.read_error: BaseException | None = None
         self.photos: dict[int, bytes] = {}
         self.photo_error: BaseException | None = None
+        self.photo_errors: list[BaseException] = []  # raised once each, first
+        self.photo_gate: asyncio.Event | None = None  # downloads wait for it
         self.downloads: list[tuple[Any, Any, bool]] = []
 
     async def connect(self) -> None:
@@ -276,6 +278,10 @@ class FakeClient:
         self, entity: Any, file: Any = None, download_big: bool = True
     ) -> Any:
         self.downloads.append((entity, file, download_big))
+        if self.photo_gate is not None:
+            await self.photo_gate.wait()
+        if self.photo_errors:
+            raise self.photo_errors.pop(0)
         if self.photo_error:
             raise self.photo_error
         return self.photos.get(entity if isinstance(entity, int) else entity.id)
@@ -733,6 +739,88 @@ async def test_avatar_lines_keep_within_the_hubs_rate():
     assert len(out.of("avatar")) == AVATAR_LINES
 
     await asyncio.sleep(0.6)
+    assert len(out.of("avatar")) == AVATAR_LINES + 1
+    await stop_bridge(bridge, task)
+
+
+def person(user_id: int, photo_id: int) -> types.User:
+    return types.User(
+        id=user_id,
+        first_name=f"P{user_id}",
+        photo=types.UserProfilePhoto(photo_id=photo_id, dc_id=2),
+    )
+
+
+async def test_a_png_is_sent_and_a_too_large_photo_skipped(caplog):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    client = FakeClient([tg_msg(10)])
+    client.photos[GRACE.id] = JPEG[:4] + b"\x00" * MAX_AVATAR_BYTES
+    client.photos[44] = png
+    bridge, out, task = await _avatar_bridge(client)
+
+    await client.arrive(tg_msg(11, sender=GRACE))
+    await client.arrive(tg_msg(12, sender=person(44, 9)))
+    await settle()
+
+    (line,) = out.of("avatar")
+    assert line["author"] == "44" and line["mime"] == "image/png"
+    assert base64.b64decode(line["data"]) == png
+    assert f"avatar of 43 skipped: image/jpeg, {MAX_AVATAR_BYTES + 4} bytes" in caplog.text
+    await stop_bridge(bridge, task)
+
+
+async def test_a_photo_changed_during_its_download_is_sent_too():
+    client = FakeClient([tg_msg(10)])
+    client.photos[GRACE.id] = JPEG
+    client.photo_gate = asyncio.Event()
+    bridge, out, task = await _avatar_bridge(client)
+
+    await client.arrive(tg_msg(11, sender=GRACE))
+    await settle()
+    await client.arrive(tg_msg(12, sender=person(43, 778)))
+    await settle()
+    client.photo_gate.set()
+    await settle()
+
+    assert [line["rev"] for line in out.of("avatar")] == ["777", "778"]
+    await stop_bridge(bridge, task)
+
+
+async def test_a_download_without_an_answer_is_tried_again_on_the_same_connection(caplog):
+    client = FakeClient([tg_msg(10)])
+    client.photos[GRACE.id] = JPEG
+    client.photo_errors = [ConnectionError("reset")]
+    bridge, out, task = await _avatar_bridge(client, avatar_retry=0.5)
+
+    await client.arrive(tg_msg(11, sender=GRACE))
+    await settle()
+    assert out.of("avatar") == [] and "avatar of 43: no answer" in caplog.text
+    await asyncio.sleep(0.5)
+
+    assert [line["rev"] for line in out.of("avatar")] == ["777"]
+    assert not task.done() and client.connected
+    await stop_bridge(bridge, task)
+
+
+async def test_avatars_still_waiting_are_sent_after_a_reconnect():
+    people = [person(100 + i, i) for i in range(AVATAR_LINES + 1)]
+    client = FakeClient([tg_msg(10)])
+    for p in people:
+        client.photos[p.id] = JPEG
+    bridge, out, task = await _avatar_bridge(client, avatar_window=3600)
+    for i, p in enumerate(people):
+        await client.arrive(tg_msg(11 + i, sender=p))
+    await settle()
+    assert len(out.of("avatar")) == AVATAR_LINES
+
+    await client.disconnect()
+    await client.arrive(tg_msg(100, sender=None))
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(task, 2)
+    bridge.avatar_window = 0.01
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+
     assert len(out.of("avatar")) == AVATAR_LINES + 1
     await stop_bridge(bridge, task)
 

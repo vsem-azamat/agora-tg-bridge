@@ -47,7 +47,7 @@ The marker (`Marker`: `--prefix`, optionally `--custom-emoji-id`) tells assistan
 
 When the backend names each sender's profile photo (`sender_photo` in the record; only the Telethon backend does), the `in` line's author carries `avatar_rev`: the photo's id, or `none` for a sender without a photo or one who hides it. The first time a process sees a person with a rev, it writes an `avatar` line for them: the small profile photo (160 px JPEG) in base64 with its `mime`, or empty `data` for `none`. The hub ignores a rev it already has without decoding, so sending every avatar again after a restart costs nothing there. The account's own messages and assistants' messages carry no avatar: the hub shows them as the operator's or an assistant's.
 
-Avatar lines are written by their own loop, outside the chat lock, at most 30 in any 61 s (`AVATAR_LINES`, `AVATAR_WINDOW_SECONDS`; the hub drops more than 30 a minute); the others wait their turn, oldest first. A photo that cannot be downloaded, or that is not a JPEG or PNG of at most 256 KiB, is logged and skipped until the person's photo changes.
+Avatar lines are written by their own loop, outside the chat lock, at most 30 in any 65 s (`AVATAR_LINES`, `AVATAR_WINDOW_SECONDS`; the hub drops more than 30 a minute); the others wait their turn, oldest first, also across a reconnect. A download that gets no answer goes to the back of the queue and the loop pauses for 30 s (`AVATAR_RETRY_SECONDS`); it does not end the connection. A photo Telegram refuses, or one that is not a JPEG or PNG of at most 256 KiB, is logged and skipped until the person's photo changes.
 
 ## Outbound
 

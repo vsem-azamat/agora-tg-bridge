@@ -46,7 +46,8 @@ CLAIM_WINDOW_SECONDS = 30.0  # lines handed this soon after `hello` may be an ea
 RECHECK_SECONDS = 65.0  # telegram-mcp may still be sleeping through a 60 s flood wait
 STARTUP_ATTEMPTS = 6
 AVATAR_LINES = 30  # the hub takes at most 30 avatar lines a minute from a bridge
-AVATAR_WINDOW_SECONDS = 61.0  # a minute, with a margin
+AVATAR_WINDOW_SECONDS = 65.0  # a minute, with a margin for the hub's own timing
+AVATAR_RETRY_SECONDS = 30.0  # after a photo download got no answer
 MAX_AVATAR_BYTES = 256 * 1024  # the hub refuses larger PNG and JPEG images
 NO_AVATAR_REV = "none"  # the rev of "this person has no avatar"
 IMAGE_SIGNATURES = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"))
@@ -155,6 +156,7 @@ class Bridge:
         recheck_seconds: float = RECHECK_SECONDS,
         marker: Marker | None = None,
         avatar_window: float = AVATAR_WINDOW_SECONDS,
+        avatar_retry: float = AVATAR_RETRY_SECONDS,
     ) -> None:
         self.chat = chat
         self.marker = marker or Marker()
@@ -164,6 +166,7 @@ class Bridge:
         self.fresh_grace = fresh_grace
         self.recheck_seconds = recheck_seconds
         self.avatar_window = avatar_window
+        self.avatar_retry = avatar_retry
         self.hello_cursor: int | None = None  # where this process started reading
         self._hello_at: float | None = None
         self.cursor: int | None = None
@@ -299,20 +302,37 @@ class Bridge:
         return line
 
     async def _avatars_loop(self) -> None:
+        """Answer the wanted avatars, oldest first. A download without an answer
+        is tried again later, at the back of the queue: it does not end the
+        connection, which the other loops judge."""
         while True:
-            await self._avatar_wake.wait()
-            self._avatar_wake.clear()
-            while self._avatar_wanted:
-                await self._avatar_turn()
-                author, rev = next(iter(self._avatar_wanted.items()))
+            if not self._avatar_wanted:
+                self._avatar_wake.clear()
+                await self._avatar_wake.wait()
+                continue
+            await self._avatar_turn()
+            author, rev = next(iter(self._avatar_wanted.items()))
+            try:
                 line = await self._avatar_line(author, rev)
+            except TransportError as exc:
+                log.warning(
+                    "avatar of %s: no answer (%s); trying again in %.0f s",
+                    author,
+                    short_reason(exc, 120),
+                    self.avatar_retry,
+                )
                 if self._avatar_wanted.get(author) == rev:
                     del self._avatar_wanted[author]
-                # A photo that could not be read is not asked for again until it changes.
-                self._avatar_revs[author] = rev
-                if line is not None:
-                    self.emit(line)
-                    self._avatar_times.append(time.monotonic())
+                    self._avatar_wanted[author] = rev
+                await asyncio.sleep(self.avatar_retry)
+                continue
+            if self._avatar_wanted.get(author) == rev:
+                del self._avatar_wanted[author]
+            # A photo that could not be read is not asked for again until it changes.
+            self._avatar_revs[author] = rev
+            if line is not None:
+                self.emit(line)
+                self._avatar_times.append(time.monotonic())
 
     async def sync(self) -> int:
         """Read the chat after the cursor and emit what is new; returns the count."""
