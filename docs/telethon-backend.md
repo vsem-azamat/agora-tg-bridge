@@ -26,7 +26,7 @@ The bridge loads the session into memory (a `StringSession`) and never writes th
 
 ## Profile photos
 
-The backend keeps the last 2000 senders it read (`SENDERS_KEPT`) and downloads a sender's small profile photo through that entity (`download_profile_photo`, `download_big=False`), so senders Telegram sends only as min users work too. A sender no longer kept is asked for by id; one Telethon cannot find is a refusal, like Telegram's own errors.
+The backend keeps the last 2000 senders it read (`SENDERS_KEPT`) and downloads a sender's small profile photo through that entity (`download_profile_photo`, `download_big=False`), so senders Telegram sends only as min users work too. A kept sender without a photo has none and nothing is downloaded. A sender no longer kept is asked for by id; one Telethon cannot find, and a download that brings nothing (Telethon's answer to some refusals), is a refusal like Telegram's own errors, so a failed download is never reported as no photo.
 
 ## Sending
 

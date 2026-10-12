@@ -853,6 +853,8 @@ async def test_without_get_profile_photo_no_avatar_is_announced():
     [
         "An error occurred (code: GET_PROFILE_PHOTO-ERR-1).",
         json.dumps({"peer_id": 43, "photo_id": "777", "data": "QUJD!"}),
+        json.dumps({"peer_id": 43, "photo_id": "777"}),  # a photo, but no picture
+        json.dumps({"peer_id": 44, "photo_id": "777", "data": "/9j/4A=="}),  # someone else
         json.dumps(["unexpected"]),
     ],
 )

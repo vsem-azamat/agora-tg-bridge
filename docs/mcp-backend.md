@@ -24,7 +24,7 @@ Messages of the chat with an id above `after_id`, oldest first; without `after_i
 
 Arguments: `peer_id`.
 
-A peer's current profile photo as a small JPEG: JSON with `peer_id`, `photo_id` (the id `sender_photo` names; `""` for none) and, with a photo, `mime` and `data` (base64). When the endpoint does not offer it, the backend drops `sender_photo` from the records, so the bridge announces no avatars it could not send. An answer that is not this JSON is a refusal: the bridge logs it and skips that person's avatar until the photo changes.
+A peer's current profile photo as a small JPEG: JSON with `peer_id`, `photo_id` (the id `sender_photo` names; `""` for none) and, with a photo, `mime` and `data` (base64). When the endpoint does not offer it, the backend drops `sender_photo` from the records, so the bridge announces no avatars it could not send. An answer that is not this JSON, names another peer, or names a photo without `data` is a refusal: the bridge logs it and skips that person's avatar until the photo changes, so a photo that failed to download is never recorded as none.
 
 ## `wait_for_events`
 

@@ -141,10 +141,12 @@ class McpBackend:
             result = json.loads(text)
         except json.JSONDecodeError:
             raise ToolError(_short(text)) from None
-        if not isinstance(result, dict):
+        if not isinstance(result, dict) or result.get("peer_id") != sender_id:
             raise ToolError(f"unexpected {PHOTO_TOOL} result")
-        if not result.get("photo_id") or not result.get("data"):
+        if result.get("photo_id") == "":
             return None
+        if not result.get("data"):
+            raise ToolError(f"{PHOTO_TOOL} gave no picture")
         try:
             return base64.b64decode(str(result["data"]), validate=True)
         except (binascii.Error, ValueError):

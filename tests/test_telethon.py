@@ -613,8 +613,21 @@ async def test_profile_photo_is_downloaded_small_through_the_seen_sender():
 
     assert await backend.profile_photo(GRACE.id) == JPEG
     assert client.downloads == [(GRACE, bytes, False)]
-    assert await backend.profile_photo(ADA.id) is None  # not seen: asked by id, has none
-    assert client.downloads[-1][0] == ADA.id
+    with pytest.raises(ToolError):  # not seen: asked by id, and nothing came
+        await backend.profile_photo(44)
+    assert client.downloads[-1][0] == 44
+
+
+async def test_a_seen_sender_without_a_photo_has_none_and_an_empty_download_is_refused():
+    client = FakeClient([tg_msg(10), tg_msg(11, sender=GRACE)])
+    backend = backend_for(client)
+    await backend.start()
+    await backend.messages_after(CHAT, 0, 10)
+
+    assert await backend.profile_photo(ADA.id) is None
+    assert client.downloads == []
+    with pytest.raises(ToolError):  # Grace has a photo, but nothing came
+        await backend.profile_photo(GRACE.id)
 
 
 @pytest.mark.parametrize(

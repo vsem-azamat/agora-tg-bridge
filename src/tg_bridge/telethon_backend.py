@@ -301,6 +301,8 @@ class TelethonBackend:
     async def profile_photo(self, sender_id: int) -> bytes | None:
         self._check_connected()
         entity = self._senders.get(sender_id, sender_id)
+        if not isinstance(entity, int) and not photo_rev(entity):
+            return None
         with telegram_errors("download a profile photo"):
             try:
                 data = await asyncio.wait_for(
@@ -309,7 +311,11 @@ class TelethonBackend:
                 )
             except ValueError:  # not in the session's cache any more
                 raise ToolError("download a profile photo: unknown sender") from None
-        return data or None
+        if not data:
+            # Telethon answers some refused downloads, and a peer without a
+            # photo asked for by id, with nothing: not a known "no photo".
+            raise ToolError("download a profile photo: nothing downloaded")
+        return data
 
     async def wait_for_events(self, chat_id: int, timeout: float) -> bool:
         self._check_connected()
