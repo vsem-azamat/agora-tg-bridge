@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from typing import Any
 
@@ -57,6 +58,7 @@ class FakeTelegram:
         self.history_errors: list[Exception] = []
         self.sends = 0
         self.closed = False
+        self.photos: dict[int, str] = {}  # get_profile_photo answers by peer id
 
     async def aclose(self) -> None:
         self.closed = True
@@ -119,6 +121,8 @@ class FakeTelegram:
             if self.send_error:
                 raise self.send_error
             return f"Message sent successfully. message_id={self.next_id}"
+        if name == "get_profile_photo":
+            return self.photos[args["peer_id"]]
         raise AssertionError(name)
 
 
@@ -784,6 +788,86 @@ async def test_stdin_closing_before_hello_returns():
     bridge = Bridge(CHAT, Out())
     bridge.closed.set()
     await asyncio.wait_for(bridge.serve(McpBackend(FakeTelegram())), 1)
+
+
+# --- avatars through telegram-mcp ---------------------------------------------
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+
+
+def photo_answer(photo_id: str, data: bytes = JPEG) -> str:
+    return json.dumps(
+        {
+            "peer_id": 43,
+            "photo_id": photo_id,
+            "mime": "image/jpeg",
+            "data": base64.b64encode(data).decode(),
+        }
+    )
+
+
+async def test_avatars_come_from_get_profile_photo():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.tools.append("get_profile_photo")
+    tg.photos[43] = photo_answer("777")
+    tg.photos[42] = json.dumps({"peer_id": 42, "photo_id": ""})
+    bridge, out, task = await started(tg, "10")
+
+    tg.arrive(msg(11, sender="Grace", sender_id=43, sender_photo="777"))
+    tg.arrive(msg(12, sender_photo="555"))  # gone by the time it is asked for
+    await settle()
+
+    ins = [line for line in out.of("in") if "id" in line]
+    assert [line["author"]["avatar_rev"] for line in ins] == ["777", "555"]
+    assert out.of("avatar") == [
+        {
+            "type": "avatar",
+            "author": "43",
+            "mime": "image/jpeg",
+            "data": base64.b64encode(JPEG).decode(),
+            "rev": "777",
+        },
+        {"type": "avatar", "author": "42", "data": "", "rev": "555"},
+    ]
+    assert ("get_profile_photo", {"peer_id": 43}) in tg.calls
+    await stop(bridge, task)
+
+
+async def test_without_get_profile_photo_no_avatar_is_announced():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, "10")
+
+    tg.arrive(msg(11, sender_photo="777"))
+    await settle()
+
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert "avatar_rev" not in line["author"]
+    assert out.of("avatar") == []
+    assert all(name != "get_profile_photo" for name, _ in tg.calls)
+    await stop(bridge, task)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "An error occurred (code: GET_PROFILE_PHOTO-ERR-1).",
+        json.dumps({"peer_id": 43, "photo_id": "777", "data": "QUJD!"}),
+        json.dumps(["unexpected"]),
+    ],
+)
+async def test_a_profile_photo_that_cannot_be_read_is_skipped(answer, caplog):
+    tg = FakeTelegram(history=[msg(10)])
+    tg.tools.append("get_profile_photo")
+    tg.photos[43] = answer
+    bridge, out, task = await started(tg, "10")
+
+    tg.arrive(msg(11, sender_id=43, sender_photo="777"))
+    await settle()
+
+    assert out.of("avatar") == [] and "avatar of 43 not read" in caplog.text
+    assert not task.done()
+    await stop(bridge, task)
 
 
 def test_split_message_respects_utf16_limit():
