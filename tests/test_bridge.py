@@ -60,12 +60,19 @@ class FakeTelegram:
         self.sends = 0
         self.closed = False
         self.photos: dict[int, str] = {}  # get_profile_photo answers by peer id
+        # A server whose records name forum topics: titles by topic id. None is a
+        # server that does not (its get_messages_after says nothing of `topics`).
+        self.topic_titles: dict[int, str] | None = None
+        self.hide_topics_mark = False  # the tool list is older than the server
 
     async def aclose(self) -> None:
         self.closed = True
 
-    async def list_tools(self) -> list[str]:
-        return self.tools
+    async def list_tools(self) -> dict[str, str]:
+        description = "Messages of a chat newer than `after_id`."
+        if self.topic_titles is not None and not self.hide_topics_mark:
+            description += " A forum's records carry `topic`, the result `topics`."
+        return {name: description if name == "get_messages_after" else "" for name in self.tools}
 
     def arrive(self, rec: dict) -> None:
         self.history.append(rec)
@@ -84,14 +91,18 @@ class FakeTelegram:
                 found = [m for m in self.history if m["id"] > args["after_id"]][:limit]
             else:
                 found = self.history[-limit:]
-            return json.dumps(
-                {
-                    "chat_id": CHAT,
-                    "chat_type": self.chat_type,
-                    "has_more": len(found) >= limit,
-                    "messages": found,
-                }
-            )
+            result: dict[str, Any] = {
+                "chat_id": CHAT,
+                "chat_type": self.chat_type,
+                "has_more": len(found) >= limit,
+                "messages": found,
+            }
+            if self.topic_titles is not None:
+                shown = {str(m["topic"]) for m in found if "topic" in m}
+                titles = {str(k): v for k, v in self.topic_titles.items() if str(k) in shown}
+                if titles:
+                    result["topics"] = titles
+            return json.dumps(result)
         if name == "wait_for_events":
             if args.get("after_seq", 0) >= self.seq and args["timeout"] > 0:
                 self.event.clear()
@@ -100,8 +111,15 @@ class FakeTelegram:
                 except TimeoutError:
                     pass
             events = [{"seq": self.seq}] if self.seq > args.get("after_seq", 0) else []
+            reset = bool(args.get("boot")) and args["boot"] != self.boot
             return json.dumps(
-                {"boot": self.boot, "gap": False, "last_seq": self.seq, "events": events}
+                {
+                    "boot": self.boot,
+                    "gap": reset,
+                    "reset": reset,
+                    "last_seq": self.seq,
+                    "events": [] if reset else events,
+                }
             )
         if name == "send_message":
             self.sends += 1
@@ -990,3 +1008,153 @@ async def test_a_message_an_earlier_process_sent_under_the_agents_name_is_claime
     assert [a for name, a in tg.calls if name == "send_message"] == []
     assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": "11"}]
     await stop(bridge, task)
+
+
+# --- forum topics over telegram-mcp -----------------------------------------
+
+
+def in_topic_rec(msg_id: int, topic: int, text: str = "hi", **extra: Any) -> dict[str, Any]:
+    return msg(msg_id, text, topic=topic, **extra)
+
+
+def topic_out(out_id: int, text: str, thread: str, **extra: Any) -> str:
+    author = {"name": "secretary", "kind": "agent", "display": "secretary"}
+    line = {"type": "out", "id": out_id, "author": author, "text": text, "thread": thread}
+    return json.dumps({**line, **extra})
+
+
+async def test_topic_records_become_titled_threads_and_hello_is_repeated_with_threads():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {77: "Release", 78: "Ideas"}
+    bridge, out, task = await started(tg, cursor="10")
+    assert out.of("hello") == [
+        {"type": "hello", "version": 3, "caps": {"personas": "prefix"}},
+        {"type": "hello", "version": 3, "caps": {"personas": "prefix", "threads": "topic"}},
+    ]
+
+    tg.arrive(in_topic_rec(11, 77, "release today"))
+    tg.arrive(in_topic_rec(12, 77, "at five", reply_to=11))
+    tg.arrive(in_topic_rec(13, 78, "an idea"))
+    await settle()
+
+    ins = {line["id"]: line for line in out.of("in") if "id" in line}
+    assert ins["11"]["thread"] == {"key": "77", "title": "Release"}
+    assert ins["12"]["thread"] == {"key": "77", "title": "Release"}
+    assert ins["12"]["reply_to"] == "11" and "reply_to" not in ins["11"]
+    assert ins["13"]["thread"] == {"key": "78", "title": "Ideas"}
+    await stop(bridge, task)
+
+
+async def test_the_general_topic_is_the_room():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {1: "General"}
+    bridge, out, task = await started(tg, cursor="10")
+
+    tg.arrive(in_topic_rec(11, 1, "in general"))
+    await settle()
+
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert "thread" not in line
+    await stop(bridge, task)
+
+
+async def test_a_topic_without_a_title_still_makes_a_thread():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {}  # the server names topics but could not read this title
+    bridge, out, task = await started(tg, cursor="10")
+
+    tg.arrive(in_topic_rec(11, 77))
+    await settle()
+
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert line["thread"] == {"key": "77", "title": ""}
+    await stop(bridge, task)
+
+
+async def test_a_server_that_does_not_name_topics_keeps_the_room_and_the_caps():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10")
+
+    tg.arrive(msg(11, "in a forum, but the server names no topic", reply_to=77))
+    await settle()
+
+    assert len(out.of("hello")) == 1 and "threads" not in out.of("hello")[0]["caps"]
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert "thread" not in line and line["reply_to"] == "77"
+    await stop(bridge, task)
+
+
+async def test_a_reply_in_a_thread_goes_into_the_topic():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {77: "Release"}
+    bridge, out, task = await started(tg, cursor="10")
+
+    bridge.handle_hub_line(topic_out(5, "at five", "77"))
+    await settle()
+
+    assert [a["reply_to"] for n, a in tg.calls if n == "send_message"] == [77]
+    sent = [m for m in tg.history if m["out"]]
+    assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": str(sent[0]["id"])}]
+    await stop(bridge, task)
+
+
+async def test_a_record_with_a_topic_turns_threads_on_behind_an_old_tool_list():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {77: "Release"}
+    tg.hide_topics_mark = True  # the hub still lists the description of the old server
+    bridge, out, task = await started(tg, cursor="10")
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None]
+
+    tg.arrive(in_topic_rec(11, 77, "first in the topic"))
+    await settle()
+
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic"]
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert line["thread"] == {"key": "77", "title": "Release"}
+    # the hello with threads came before the line that needs it
+    assert out.lines.index(out.of("hello")[1]) < out.lines.index(line)
+    await stop(bridge, task)
+
+
+async def test_threads_stay_declared_after_a_reconnect_behind_an_old_tool_list():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {}
+    bridge, out, task = await started(tg, cursor="10")
+    bridge.closed.set()
+    await asyncio.wait_for(task, 2)
+    bridge.closed.clear()
+
+    stale = FakeTelegram(history=[msg(10)])  # its tool list does not name topics yet
+    task = asyncio.create_task(bridge.serve(McpBackend(stale)))
+    await settle()
+
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic"]
+    assert bridge.caps["threads"] == "topic"
+    await stop(bridge, task)
+
+
+def backend_after(records: list[dict], titles: object = None) -> tuple[McpBackend, list[dict]]:
+    backend = McpBackend(FakeTelegram())
+    backend._name_topics(records, titles)
+    return backend, records
+
+
+def test_a_topics_map_alone_shows_that_the_server_names_topics():
+    backend, _ = backend_after([msg(11)], {"77": "Release"})
+    assert backend.topics
+
+
+def test_a_record_in_general_shows_it_too_and_stays_in_the_room():
+    backend, (rec,) = backend_after([msg(11, topic=1)])
+    assert backend.topics and "topic" not in rec and "topic_title" not in rec
+
+
+def test_a_topic_that_is_not_an_id_is_ignored():
+    backend, recs = backend_after([msg(11, topic=True), msg(12, topic="77")], {"77": "x"})
+    assert all("topic" not in r and "topic_title" not in r for r in recs)
+    assert backend.topics  # the map still counts
+
+
+def test_topic_values_that_are_not_ids_do_not_show_it_without_a_map():
+    backend, _ = backend_after([msg(11, topic=True), msg(12, topic="77")])
+    assert not backend.topics

@@ -488,12 +488,20 @@ MARKER = Marker(f"{ROBOT} ", EMOJI_ID)
 async def test_bridge_reads_sends_and_skips_its_echo():
     client = FakeClient([tg_msg(10)])
     out = Out()
-    bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
+    bridge = Bridge(
+        CHAT,
+        out,
+        reconcile_seconds=3600,
+        wait_seconds=5,
+        fresh_grace=0,
+        marker=MARKER,
+        threads=True,
+    )
     bridge.handle_hub_line(hello(""))
     task = asyncio.create_task(bridge.serve(backend_for(client)))
     await settle()
     assert out.lines == [
-        {"type": "hello", "version": 3, "caps": {"personas": "prefix"}},
+        {"type": "hello", "version": 3, "caps": {"personas": "prefix", "threads": "topic"}},
         {"type": "in", "cursor": "10"},
     ]
 

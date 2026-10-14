@@ -20,18 +20,26 @@ PHOTO_TOOL = "get_profile_photo"  # optional: without it the bridge sends no ava
 READ_TIMEOUT = 60.0
 WAIT_SLACK = 30.0  # the HTTP read may last this much longer than the wait itself
 SEND_READ_TIMEOUT = 115.0  # Telethon may sleep through a 60 s flood wait; the hub allows 120 s
+# What get_messages_after's description says when its records name forum topics
+# (`topic` per message, one `topics` map of titles per result).
+TOPICS_MARK = "`topics`"
+GENERAL_TOPIC = 1  # a forum's General topic: its messages are the room's
 SENT_OK = "Message sent successfully"
 _SENT_ID = re.compile(r"message_id=(\d+)")
 
 
 class McpClient(Protocol):
-    async def list_tools(self) -> list[str]: ...
+    async def list_tools(self) -> dict[str, str]: ...
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any], *, read_timeout: float = 60.0
     ) -> str: ...
 
     async def aclose(self) -> None: ...
+
+
+def _is_topic(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _short(text: str, limit: int = 200) -> str:
@@ -44,6 +52,7 @@ class McpBackend:
         self._boot: str | None = None
         self._after_seq = 0
         self._photos = False  # the endpoint offers PHOTO_TOOL
+        self.topics = False  # get_messages_after names forum topics
 
     async def start(self) -> None:
         tools = await self._client.list_tools()
@@ -57,6 +66,12 @@ class McpBackend:
         self._photos = PHOTO_TOOL in tools
         if not self._photos:
             log.info("the endpoint does not offer %s: no avatars", PHOTO_TOOL)
+        self.topics = TOPICS_MARK in tools["get_messages_after"]
+        if not self.topics:
+            log.info(
+                "get_messages_after does not name forum topics: a forum is one room "
+                "until a record carries a topic"
+            )
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -86,6 +101,7 @@ class McpBackend:
             # A photo id the bridge cannot fetch would only drop stored avatars.
             for rec in messages:
                 rec.pop("sender_photo", None)
+        self._name_topics(messages, result.get("topics"))
         try:
             return History(
                 chat_id=int(result["chat_id"]),
@@ -95,6 +111,29 @@ class McpBackend:
             )
         except (KeyError, TypeError, ValueError):
             raise ToolError("unexpected get_messages_after result") from None
+
+    def _name_topics(self, messages: list[Any], titles: object) -> None:
+        """Give each record in a topic its title from the result's `topics` map
+        (topic id to title, sent once per result). The General topic is the
+        room's, so its records carry no topic. A record with a topic shows that
+        the server names topics even when the hub's tool list does not say so
+        (the hub may keep an older list after the server was updated)."""
+        if not self.topics and (
+            isinstance(titles, dict) or any(_is_topic(r.get("topic")) for r in messages)
+        ):
+            self.topics = True
+            log.info("records carry forum topics")
+        names = (
+            {str(k): v for k, v in titles.items() if isinstance(v, str)}
+            if isinstance(titles, dict)
+            else {}
+        )
+        for rec in messages:
+            topic = rec.get("topic")
+            if not _is_topic(topic) or topic == GENERAL_TOPIC:
+                rec.pop("topic", None)
+            else:
+                rec["topic_title"] = names.get(str(topic), "")
 
     async def wait_for_events(self, chat_id: int, timeout: float) -> bool:
         args: dict[str, Any] = {

@@ -80,7 +80,7 @@ async def run(
         reconcile_seconds=config.reconcile_seconds,
         wait_seconds=config.wait_seconds,
         marker=Marker(config.prefix, config.custom_emoji_id),
-        threads=config.backend != "mcp",  # telegram-mcp's records say nothing about topics
+        threads=config.backend != "mcp",  # the MCP backend declares it when its server can
         **kwargs,
     )
     loop = asyncio.get_running_loop()

@@ -20,6 +20,23 @@ Messages of the chat with an id above `after_id`, oldest first; without `after_i
 
 `chat_type` is `private`, `group`, `supergroup` or `channel`. A record may also carry `media` (`photo`, `voice`, `video_note`, `video`, `audio`, `gif`, `document: <name>`, `sticker <alt>`, `contact`, `geo`, `poll`), `duration`, `poll.question`, `forwarded` (`from_user`, `from_chat` or `from_name`), `transcript`, `action` (a service message) and `custom_emojis` (`[{"emoji": "🤖", "id": "…"}]`). It may also carry `sender_photo`: the id of the sender's current profile photo, `""` for none or hidden.
 
+## Forum topics
+
+A telegram-mcp server that names forum topics says so in the description of `get_messages_after`, which mentions its `topics` field. Then a record of a message in a topic carries `topic`, the topic's id (the id of the topic's first message), and the result carries one `topics` map of id to title for the topics present, so no title repeats per record:
+
+```json
+{"chat_id": -1001234567890, "chat_type": "supergroup", "has_more": false,
+ "messages": [{"id": 5520, "…": "…", "topic": 77},
+              {"id": 5521, "…": "…", "topic": 77, "reply_to": 5520}],
+ "topics": {"77": "Release"}}
+```
+
+`reply_to` is only a real reply: a message that merely sits in a topic has none. The backend copies each title into its record as `topic_title`, so records are the same as the Telethon backend's, and the bridge makes each topic a titled Agora thread as described in [Architecture](architecture.md#forum-topics). The General topic (`topic` 1) is the room's, so the backend drops its `topic`. A topic the map does not name (the server could not read its title) is a thread without a title until a later record names it; a rename shows up the same way.
+
+The bridge declares `threads: topic` in a second `hello` on either of two signals: `start` finds that mark in the description of `get_messages_after`, or a read returns a record with `topic` (or a `topics` map). The bridge sees what the hub lists, and the hub may keep the tool list it had when it connected to telegram-mcp, so a server updated to name topics behind such a list is noticed by its first record with a topic; the hello with `threads` goes out before the `in` line of that record. A server that does neither (upstream telegram-mcp, or a fork without topics) leaves `topic` out of the records and `threads` out of the caps, and a forum's messages land in the room. Once declared, `threads` stays for the process: a reconnect builds a new backend that may not know yet (the hub's list is stale), and a `hello` without `threads` would make the hub drop the `thread` of `out` lines. Going back to a server without topics means removing the bridges first, which restarts them. Limit: after a process restart behind a stale tool list, `threads` is declared only at the first record with a topic, so a reply handed to the bridge before that goes out without its thread (into the room, not the topic).
+
+An `out` line with a `thread` goes into the topic by `send_message` with `reply_to` set to the topic's id (the first part to its own `reply_to` when it has one, as in the Telethon backend); `send_message` needs nothing else for topics. The server's `wait_for_events` events carry `topic` too; the bridge only uses them as a signal.
+
 ## `get_profile_photo` (optional)
 
 Arguments: `peer_id`.

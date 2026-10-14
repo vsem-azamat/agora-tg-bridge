@@ -54,6 +54,8 @@ class Backend(Protocol):
     ToolError (Telegram refused; from `send`, nothing was sent), ChatAccessError
     (the chat may not be read), ConfigError and AuthError (fatal)."""
 
+    topics: bool  # its records name forum topics (`topic`, `topic_title`); known after `start`
+
     async def start(self) -> None:
         """Connect and check that the backend can work at all."""
 

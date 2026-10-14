@@ -205,7 +205,9 @@ class Bridge:
     ) -> None:
         self.chat = chat
         self.marker = marker or Marker()
-        # whether the backend reports forum topics, which the hub then keeps as threads
+        # whether forum topics are threads: declared from the start, or once the
+        # backend says its records name topics (see `_declare_threads`)
+        self._threads = threads
         self.caps = {**CAPS, "threads": "topic"} if threads else CAPS
         self._write = write
         self.reconcile_seconds = reconcile_seconds
@@ -245,6 +247,21 @@ class Bridge:
     def emit(self, line: dict[str, Any]) -> None:
         self._write(line)
 
+    def _emit_hello(self) -> None:
+        self.emit({"type": "hello", "version": PROTOCOL_VERSION, "caps": self.caps})
+
+    def _declare_threads(self, topics: bool) -> None:
+        """Declare `threads` once the backend's records name forum topics. It is
+        latched for the process: a reconnect builds a new backend that may not
+        know yet (the hub's tool list can be older than the server), and a hello
+        without `threads` would make the hub drop the `thread` of `out` lines.
+        The hub keeps the latest caps, so a new answer goes out as a new `hello`."""
+        if topics and not self._threads:
+            self._threads = True
+            self.caps = {**CAPS, "threads": "topic"}
+            log.info("threads: topic")
+            self._emit_hello()
+
     def handle_hub_line(self, raw: str) -> None:
         raw = raw.strip()
         if not raw:
@@ -264,7 +281,7 @@ class Bridge:
                 self.hello_cursor = self.cursor
                 self._hello_at = time.monotonic()
                 log.info("hello: bridge %s, cursor %s", line.get("bridge"), self.cursor)
-                self.emit({"type": "hello", "version": PROTOCOL_VERSION, "caps": self.caps})
+                self._emit_hello()
             self.hello_seen.set()
         elif kind == "out":
             out_id = _parse_id(line.get("id"))
@@ -293,7 +310,10 @@ class Bridge:
 
     async def _messages_after(self, after_id: int | None, limit: int) -> History:
         chat = self.chat_id if self.chat_id is not None else self.chat
-        return await self._backend.messages_after(chat, after_id, limit)
+        history = await self._backend.messages_after(chat, after_id, limit)
+        # A backend may find out from its records that it names topics.
+        self._declare_threads(self._backend.topics)
+        return history
 
     def _line_for(self, rec: dict[str, Any]) -> dict[str, Any]:
         if rec["id"] in self._own:
@@ -593,6 +613,7 @@ class Bridge:
 
     async def _startup(self) -> None:
         await self._backend.start()
+        self._declare_threads(self._backend.topics)
         if self.chat_id is None:
             await self._resolve_chat()
         # Learn the event log's position before reading, so nothing that
