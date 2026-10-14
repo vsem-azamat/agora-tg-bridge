@@ -422,7 +422,10 @@ class Bridge:
         return emitted
 
     async def _poll_events(self, timeout: float) -> bool:
-        return await self._backend.wait_for_events(self.chat_id, timeout)
+        woke = await self._backend.wait_for_events(self.chat_id, timeout)
+        # A server that restarted may name topics differently than before.
+        self._declare_threads(self._backend.topics)
+        return woke
 
     # --- Telegram side: sending -------------------------------------------
 

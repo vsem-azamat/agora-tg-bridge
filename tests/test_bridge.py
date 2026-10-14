@@ -110,8 +110,15 @@ class FakeTelegram:
                 except TimeoutError:
                     pass
             events = [{"seq": self.seq}] if self.seq > args.get("after_seq", 0) else []
+            reset = bool(args.get("boot")) and args["boot"] != self.boot
             return json.dumps(
-                {"boot": self.boot, "gap": False, "last_seq": self.seq, "events": events}
+                {
+                    "boot": self.boot,
+                    "gap": reset,
+                    "reset": reset,
+                    "last_seq": self.seq,
+                    "events": [] if reset else events,
+                }
             )
         if name == "send_message":
             self.sends += 1
@@ -1087,6 +1094,23 @@ async def test_a_reply_in_a_thread_goes_into_the_topic():
     assert [a["reply_to"] for n, a in tg.calls if n == "send_message"] == [77]
     sent = [m for m in tg.history if m["out"]]
     assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": str(sent[0]["id"])}]
+    await stop(bridge, task)
+
+
+async def test_the_caps_follow_a_server_that_restarts_without_topics():
+    tg = FakeTelegram(history=[msg(10)])
+    tg.topic_titles = {77: "Release"}
+    bridge, out, task = await started(tg, cursor="10")
+    assert out.of("hello")[-1]["caps"].get("threads") == "topic"
+
+    tg.topic_titles = None  # the server is rolled back and restarts
+    tg.boot = "boot-2"
+    tg.arrive(in_topic_rec(11, 77, "after the rollback"))
+    await settle()
+
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic", None]
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert "thread" not in line
     await stop(bridge, task)
 
 

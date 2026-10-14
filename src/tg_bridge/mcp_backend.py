@@ -62,7 +62,10 @@ class McpBackend:
         self._photos = PHOTO_TOOL in tools
         if not self._photos:
             log.info("the endpoint does not offer %s: no avatars", PHOTO_TOOL)
-        self.topics = TOPICS_MARK in tools["get_messages_after"]
+        self._set_topics(tools)
+
+    def _set_topics(self, tools: dict[str, str]) -> None:
+        self.topics = TOPICS_MARK in tools.get("get_messages_after", "")
         if not self.topics:
             log.info("get_messages_after does not name forum topics: a forum is one room")
 
@@ -145,6 +148,8 @@ class McpBackend:
             raise ToolError("unexpected wait_for_events result")
         if result.get("reset") and self._boot is not None:
             log.info("telegram-mcp restarted; reading the chat again")
+            # It may have been updated or rolled back: ask again what it names.
+            self._set_topics(await self._client.list_tools())
         self._boot = result.get("boot") or self._boot
         self._after_seq = int(result.get("last_seq") or 0)
         return bool(result.get("events") or result.get("gap") or result.get("reset"))
