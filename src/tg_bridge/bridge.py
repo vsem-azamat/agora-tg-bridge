@@ -251,14 +251,15 @@ class Bridge:
         self.emit({"type": "hello", "version": PROTOCOL_VERSION, "caps": self.caps})
 
     def _declare_threads(self, topics: bool) -> None:
-        """Declare `threads` when the backend's records name forum topics, or
-        stop declaring it when they no longer do; the hub keeps the latest caps,
-        so a changed answer goes out as a new `hello`."""
-        threads = self._threads or topics
-        caps = {**CAPS, "threads": "topic"} if threads else CAPS
-        if caps != self.caps:
-            self.caps = caps
-            log.info("threads: %s", caps.get("threads", "none"))
+        """Declare `threads` once the backend's records name forum topics. It is
+        latched for the process: a reconnect builds a new backend that may not
+        know yet (the hub's tool list can be older than the server), and a hello
+        without `threads` would make the hub drop the `thread` of `out` lines.
+        The hub keeps the latest caps, so a new answer goes out as a new `hello`."""
+        if topics and not self._threads:
+            self._threads = True
+            self.caps = {**CAPS, "threads": "topic"}
+            log.info("threads: topic")
             self._emit_hello()
 
     def handle_hub_line(self, raw: str) -> None:

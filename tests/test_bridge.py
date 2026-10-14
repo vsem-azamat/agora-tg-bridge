@@ -1075,12 +1075,12 @@ async def test_a_server_that_does_not_name_topics_keeps_the_room_and_the_caps():
     tg = FakeTelegram(history=[msg(10)])
     bridge, out, task = await started(tg, cursor="10")
 
-    tg.arrive(msg(11, "in a forum, but the server names no topic"))
+    tg.arrive(msg(11, "in a forum, but the server names no topic", reply_to=77))
     await settle()
 
     assert len(out.of("hello")) == 1 and "threads" not in out.of("hello")[0]["caps"]
     (line,) = [line for line in out.of("in") if "id" in line]
-    assert "thread" not in line
+    assert "thread" not in line and line["reply_to"] == "77"
     await stop(bridge, task)
 
 
@@ -1116,7 +1116,7 @@ async def test_a_record_with_a_topic_turns_threads_on_behind_an_old_tool_list():
     await stop(bridge, task)
 
 
-async def test_the_caps_follow_the_server_after_a_reconnect():
+async def test_threads_stay_declared_after_a_reconnect_behind_an_old_tool_list():
     tg = FakeTelegram(history=[msg(10)])
     tg.topic_titles = {}
     bridge, out, task = await started(tg, cursor="10")
@@ -1124,9 +1124,37 @@ async def test_the_caps_follow_the_server_after_a_reconnect():
     await asyncio.wait_for(task, 2)
     bridge.closed.clear()
 
-    older = FakeTelegram(history=[msg(10)])  # the server was rolled back
-    task = asyncio.create_task(bridge.serve(McpBackend(older)))
+    stale = FakeTelegram(history=[msg(10)])  # its tool list does not name topics yet
+    task = asyncio.create_task(bridge.serve(McpBackend(stale)))
     await settle()
 
-    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic", None]
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic"]
+    assert bridge.caps["threads"] == "topic"
     await stop(bridge, task)
+
+
+def backend_after(records: list[dict], titles: object = None) -> tuple[McpBackend, list[dict]]:
+    backend = McpBackend(FakeTelegram())
+    backend._name_topics(records, titles)
+    return backend, records
+
+
+def test_a_topics_map_alone_shows_that_the_server_names_topics():
+    backend, _ = backend_after([msg(11)], {"77": "Release"})
+    assert backend.topics
+
+
+def test_a_record_in_general_shows_it_too_and_stays_in_the_room():
+    backend, (rec,) = backend_after([msg(11, topic=1)])
+    assert backend.topics and "topic" not in rec and "topic_title" not in rec
+
+
+def test_a_topic_that_is_not_an_id_is_ignored():
+    backend, recs = backend_after([msg(11, topic=True), msg(12, topic="77")], {"77": "x"})
+    assert all("topic" not in r and "topic_title" not in r for r in recs)
+    assert backend.topics  # the map still counts
+
+
+def test_topic_values_that_are_not_ids_do_not_show_it_without_a_map():
+    backend, _ = backend_after([msg(11, topic=True), msg(12, topic="77")])
+    assert not backend.topics
