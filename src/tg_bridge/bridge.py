@@ -5,7 +5,7 @@ events of this chat and read again whenever something arrives, plus a safety
 read every `reconcile_seconds`.
 
 Outbound: each `out` line becomes a send job of one or more sends with the
-marker prefix in front. Before a job sends anything it looks in
+marker prefix and the agent's name in front. Before a job sends anything it looks in
 the chat for its text already delivered, but only in two cases: the job's own
 send got no answer (the connection broke or timed out), or the line came from
 the hub before `hello` or within 30 s of it (a message an earlier process sent
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tg_bridge.backend import Backend, History
-from tg_bridge.config import DEFAULT_PREFIX, ConfigError
+from tg_bridge.config import DEFAULT_PREFIX, MAX_PREFIX_UTF16, ConfigError
 from tg_bridge.errors import ChatAccessError, ToolError, TransportError
 from tg_bridge.render import in_line
 from tg_bridge.text import normalize, normalize_start, utf16_len
@@ -38,7 +38,11 @@ from tg_bridge.text import normalize, normalize_start, utf16_len
 log = logging.getLogger("tg_bridge")
 
 ASSISTANT_ID = "assistant"
-MAX_MESSAGE_UTF16 = 4000  # Telegram allows 4096; leave room for the prefix
+MAX_PERSONA_UTF16 = 32  # Agora's longest agent name
+PERSONA_SEPARATOR = ": "  # between the persona and the text
+# Telegram allows 4096; leave room for the longest prefix, persona and separator.
+MAX_MESSAGE_UTF16 = 4096 - MAX_PREFIX_UTF16 - MAX_PERSONA_UTF16 - utf16_len(PERSONA_SEPARATOR)
+CAPS = {"personas": "prefix"}  # agents are named in the text after the prefix
 HISTORY_PAGE = 100
 DELIVERY_CHECK_PAGES = 10
 FRESH_GRACE_SECONDS = 1.5  # the hub hands unanswered messages within a second of `hello`
@@ -85,8 +89,10 @@ class Marker:
     prefix: str = DEFAULT_PREFIX
     custom_emoji_id: str | None = None
 
-    def text(self, chunk: str) -> str:
-        return self.prefix + chunk
+    def text(self, chunk: str, persona: str = "") -> str:
+        """The text sent for one part: the prefix, then the agent's name when
+        the message is an agent's."""
+        return self.prefix + (persona + PERSONA_SEPARATOR if persona else "") + chunk
 
     @property
     def assistant_author(self) -> dict[str, Any]:
@@ -109,6 +115,27 @@ class Marker:
             isinstance(e, dict) and str(e.get("id")) == self.custom_emoji_id
             for e in rec.get("custom_emojis") or []
         )
+
+
+def persona(author: Any) -> str:
+    """The name an `out` line's author is shown under after the prefix: an
+    agent's display name (else its name) on one line, cut to
+    `MAX_PERSONA_UTF16`; "" for the operator (`kind` `human`) or an author
+    without a usable name."""
+    if not isinstance(author, dict) or author.get("kind") == "human":
+        return ""
+    for key in ("display", "name"):
+        name = author.get(key)
+        if not isinstance(name, str):
+            continue
+        name = " ".join(normalize(name.replace("\u2028", " ").replace("\u2029", " ")).split())
+        name = name[:MAX_PERSONA_UTF16]
+        while utf16_len(name) > MAX_PERSONA_UTF16:
+            name = name[:-1]
+        name = name.rstrip()
+        if name:
+            return name
+    return ""
 
 
 def short_reason(text: Any, limit: int = 200) -> str:
@@ -142,6 +169,7 @@ class SendJob:
     ids: list[int] = field(default_factory=list)
     claim_from: int | None = None  # look in the chat after this id before sending
     uncertain: bool = False  # part `done` may have gone out; its call got no answer
+    persona: str = ""  # the agent named after the prefix in every part
 
 
 class Bridge:
@@ -217,6 +245,7 @@ class Bridge:
                 self.hello_cursor = self.cursor
                 self._hello_at = time.monotonic()
                 log.info("hello: bridge %s, cursor %s", line.get("bridge"), self.cursor)
+                self.emit({"type": "hello", "caps": CAPS})
             self.hello_seen.set()
         elif kind == "out":
             out_id = _parse_id(line.get("id"))
@@ -380,7 +409,7 @@ class Bridge:
                 if rec["id"] in self._own or not self.marker.matches(rec):
                     continue
                 if normalize(str(rec.get("text") or "")) != normalize(
-                    self.marker.text(job.chunks[job.done])
+                    self.marker.text(job.chunks[job.done], job.persona)
                 ):
                     continue
                 expected_reply = job.reply_to if job.done == 0 else None
@@ -408,6 +437,7 @@ class Bridge:
             chunks=split_message(text),
             reply_to=_parse_id(line.get("reply_to")),
             cursor_before=self.cursor or 0,
+            persona=persona(line.get("author")),
         )
         if line.get("_maybe_earlier"):
             # Possibly sent by an earlier process: its copy may already be
@@ -443,7 +473,7 @@ class Bridge:
             try:
                 msg_id = await self._backend.send(
                     self.chat_id,
-                    self.marker.text(job.chunks[job.done]),
+                    self.marker.text(job.chunks[job.done], job.persona),
                     reply_to=job.reply_to if job.done == 0 else None,
                     custom_emoji_id=self.marker.custom_emoji_id,
                 )

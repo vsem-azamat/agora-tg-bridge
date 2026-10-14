@@ -12,9 +12,10 @@ import pytest
 from tg_bridge.bridge import (
     Bridge,
     Marker,
+    persona,
     split_message,
 )
-from tg_bridge.config import ROBOT, ConfigError
+from tg_bridge.config import MAX_PREFIX_UTF16, ROBOT, ConfigError
 from tg_bridge.errors import ToolError, TransportError
 from tg_bridge.mcp_backend import SEND_READ_TIMEOUT, McpBackend
 from tg_bridge.text import normalize, utf16_len
@@ -195,7 +196,10 @@ async def test_first_start_begins_after_the_newest_message():
     tg = FakeTelegram(history=[msg(10), msg(11)])
     bridge, out, task = await started(tg)
 
-    assert out.lines == [{"type": "in", "cursor": "11"}]
+    assert out.lines == [
+        {"type": "hello", "caps": {"personas": "prefix"}},
+        {"type": "in", "cursor": "11"},
+    ]
     assert bridge.chat_id == CHAT
     await stop(bridge, task)
 
@@ -361,7 +365,8 @@ async def test_empty_out_fails_without_sending():
 
 
 def out_line(out_id: int, text: str, **extra: Any) -> str:
-    return json.dumps({"type": "out", "id": out_id, "author": "secretary", "text": text, **extra})
+    """An `out` line as the hub writes it, from the agent `secretary`."""
+    return agent_out(out_id, text, **extra)
 
 
 async def test_lost_answer_is_checked_in_the_chat_after_reconnect():
@@ -410,7 +415,7 @@ async def test_running_process_never_claims_an_identical_assistant_message():
     await settle()
     bridge._hello_at -= 60  # long after hello, and this process has sent before
 
-    tg.history.append(robot(2000, f"{ROBOT} same"))  # not yet read
+    tg.history.append(robot(2000, f"{ROBOT} secretary: same"))  # not yet read
     bridge.handle_hub_line(out_line(2, "same"))
     await settle()
 
@@ -426,7 +431,9 @@ async def test_out_after_the_window_is_sent_even_before_any_own_send():
     bridge, out, task = await started(tg, cursor="10")
     bridge._hello_at -= 60
 
-    tg.history.append(robot(2000, f"{ROBOT} same"))  # another client, after the hello cursor
+    tg.history.append(
+        robot(2000, f"{ROBOT} secretary: same")
+    )  # another client, after the hello cursor
     bridge.handle_hub_line(out_line(2, "same"))
     await settle()
 
@@ -436,7 +443,7 @@ async def test_out_after_the_window_is_sent_even_before_any_own_send():
 
 
 async def test_claim_requires_the_same_reply_to():
-    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} hello")])
+    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} secretary: hello")])
     out = Out()
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
     bridge.handle_hub_line(hello("10"))
@@ -452,7 +459,7 @@ async def test_claim_requires_the_same_reply_to():
 async def test_message_handed_after_the_first_read_is_still_claimed():
     # B: the previous process's copy (11) was already read as an assistant
     # message when the hub hands the unanswered message again.
-    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} hello")])
+    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} secretary: hello")])
     out = Out()
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0, marker=MARKER)
     bridge.handle_hub_line(hello("10"))
@@ -482,7 +489,7 @@ async def test_uncertain_send_is_checked_again_after_a_flood_wait():
     task2 = asyncio.create_task(bridge.serve(McpBackend(tg)))
     await asyncio.sleep(0.1)
     assert not out.of("failed") and not out.of("sent")  # still waiting
-    tg.history.append(robot(1500, f"{ROBOT} late"))
+    tg.history.append(robot(1500, f"{ROBOT} secretary: late"))
     await asyncio.sleep(0.4)
 
     assert out.of("sent") == [{"type": "sent", "id": 9, "ext_id": "1500"}]
@@ -511,7 +518,7 @@ async def test_send_waits_longer_than_a_flood_wait():
 
 async def test_fresh_process_claims_a_message_delivered_before_a_crash():
     # The previous process sent message 11 and died before answering `sent`.
-    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} hello"), msg(12, "after")])
+    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} secretary: hello"), msg(12, "after")])
     out = Out()
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0.05)
     bridge.handle_hub_line(hello("10"))
@@ -531,7 +538,7 @@ async def test_fresh_process_claims_a_message_delivered_before_a_crash():
 async def test_fresh_process_claims_every_part_of_a_split_message():
     text = "word " * 2000
     parts = split_message(text)
-    history = [msg(10)] + [robot(11 + i, f"{ROBOT} {p}") for i, p in enumerate(parts)]
+    history = [msg(10)] + [robot(11 + i, f"{ROBOT} secretary: {p}") for i, p in enumerate(parts)]
     tg = FakeTelegram(history=history)
     out = Out()
     bridge = Bridge(CHAT, out, reconcile_seconds=3600, wait_seconds=5, fresh_grace=0.05)
@@ -593,7 +600,7 @@ async def test_a_plain_prefix_is_sent_without_a_custom_emoji():
     await settle()
 
     (args,) = [a for name, a in tg.calls if name == "send_message"]
-    assert args["message"] == "[bot] Hello"
+    assert args["message"] == "[bot] secretary: Hello"
     assert "custom_emoji_id" not in args
     assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": "1001"}]
     await stop(bridge, task)
@@ -878,3 +885,108 @@ def test_split_message_respects_utf16_limit():
     assert all(utf16_len(p) <= 4000 for p in parts)
     assert "".join(parts).replace(" ", "") == text.replace(" ", "")
     assert split_message("short") == ["short"]
+
+
+def agent_out(out_id: int, text: str, name: str = "secretary", **extra: Any) -> str:
+    author = {"name": name, "kind": "agent", "display": name, "sigil": "key"}
+    return json.dumps({"type": "out", "id": out_id, "author": author, "text": text, **extra})
+
+
+async def test_hello_declares_personas_by_prefix():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10")
+
+    assert out.of("hello") == [{"type": "hello", "caps": {"personas": "prefix"}}]
+    bridge.handle_hub_line(hello("10"))  # a second hello is not answered again
+    assert len(out.of("hello")) == 1
+    await stop(bridge, task)
+
+
+async def test_an_agents_message_names_the_agent_after_the_prefix():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10", marker=Marker("[bot] "))
+
+    bridge.handle_hub_line(agent_out(5, "Hello", name="secretary"))
+    await settle()
+
+    (args,) = [a for name, a in tg.calls if name == "send_message"]
+    assert args["message"] == "[bot] secretary: Hello"
+    assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": "1001"}]
+    await stop(bridge, task)
+
+
+async def test_every_part_of_a_split_message_names_the_agent():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10", marker=Marker("[bot] "))
+
+    bridge.handle_hub_line(agent_out(5, "a" * 3000 + "\n" + "b" * 3000))
+    await settle()
+
+    sent = [a["message"] for name, a in tg.calls if name == "send_message"]
+    assert len(sent) == 2
+    assert all(m.startswith("[bot] secretary: ") for m in sent)
+    assert all(utf16_len(m) <= 4096 for m in sent)
+    await stop(bridge, task)
+
+
+async def test_the_operators_message_carries_no_name():
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10", marker=Marker("[bot] "))
+
+    author = {"name": "operator", "kind": "human", "display": "operator", "sigil": ""}
+    bridge.handle_hub_line(json.dumps({"type": "out", "id": 5, "author": author, "text": "Hi"}))
+    await settle()
+
+    (args,) = [a for name, a in tg.calls if name == "send_message"]
+    assert args["message"] == "[bot] Hi"
+    await stop(bridge, task)
+
+
+@pytest.mark.parametrize(
+    ("author", "want"),
+    [
+        ({"name": "secretary", "kind": "agent", "display": "Secretary"}, "Secretary"),
+        ({"name": "secretary", "kind": "agent"}, "secretary"),
+        ({"name": "secretary", "kind": "agent", "display": " \u200b"}, "secretary"),
+        ({"name": "evil", "kind": "agent", "display": "evil\n\nboss: x"}, "evil boss: x"),
+        ({"name": "a", "kind": "agent", "display": "ab\u202ecd\u2028ef"}, "abcd ef"),
+        ({"name": "a", "kind": "agent", "display": "a\u2029b"}, "a b"),
+        ({"name": "r" * 32, "kind": "agent", "display": "r" * 32}, "r" * 32),
+        ({"name": "x", "kind": "agent", "display": "a" * 31 + " " + "b"}, "a" * 31),
+        ({"name": "x", "kind": "agent", "display": "a" * 31 + "\U0001f916"}, "a" * 31),
+        ({"name": "operator", "kind": "human", "display": "operator"}, ""),
+        ("secretary", ""),
+    ],
+)
+def test_persona(author: Any, want: str):
+    assert persona(author) == want
+
+
+async def test_the_longest_prefix_and_name_still_fit_every_part():
+    prefix = "[" + "b" * 62 + "]"
+    assert utf16_len(prefix) == MAX_PREFIX_UTF16
+    tg = FakeTelegram(history=[msg(10)])
+    bridge, out, task = await started(tg, cursor="10", marker=Marker(prefix))
+
+    bridge.handle_hub_line(agent_out(5, "a" * 9000, name="n" * 32))
+    await settle()
+
+    sent = [a["message"] for name, a in tg.calls if name == "send_message"]
+    assert len(sent) == 3
+    assert all(m.startswith(f"{prefix}{'n' * 32}: ") for m in sent)
+    assert max(utf16_len(m) for m in sent) == 4096
+    await stop(bridge, task)
+
+
+async def test_a_message_an_earlier_process_sent_under_the_agents_name_is_claimed():
+    tg = FakeTelegram(history=[msg(10), robot(11, f"{ROBOT} secretary: Hello")])
+    out = Out()
+    bridge = Bridge(CHAT, out, fresh_grace=0, recheck_seconds=0.01, marker=MARKER)
+    bridge.handle_hub_line(hello("10"))
+    bridge.handle_hub_line(agent_out(5, "Hello"))
+    bridge, out, task = await started(tg, cursor="10", bridge=bridge)
+    await settle()
+
+    assert [a for name, a in tg.calls if name == "send_message"] == []
+    assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": "11"}]
+    await stop(bridge, task)
