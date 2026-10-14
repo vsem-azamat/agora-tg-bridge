@@ -239,6 +239,8 @@ class FakeClient:
         self.photo_errors: list[BaseException] = []  # raised once each, first
         self.photo_gate: asyncio.Event | None = None  # downloads wait for it
         self.downloads: list[tuple[Any, Any, bool]] = []
+        self.topics: dict[int, str] = {}  # forum topic titles by topic id
+        self.topic_reads: list[list[int]] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -285,6 +287,18 @@ class FakeClient:
         if self.photo_error:
             raise self.photo_error
         return self.photos.get(entity if isinstance(entity, int) else entity.id)
+
+    async def __call__(self, request: Any) -> Any:
+        if type(request).__name__ == "GetForumTopicsByIDRequest":
+            self.topic_reads.append(list(request.topics))
+            return SimpleNamespace(
+                topics=[
+                    SimpleNamespace(id=t, title=self.topics[t])
+                    for t in request.topics
+                    if t in self.topics
+                ]
+            )
+        raise AssertionError(type(request).__name__)
 
     async def arrive(self, msg: Any) -> None:
         self.history.append(msg)
@@ -858,5 +872,94 @@ async def test_avatars_still_waiting_are_sent_after_a_reconnect():
 
 
 async def stop_bridge(bridge: Bridge, task: asyncio.Task) -> None:
+    bridge.closed.set()
+    await asyncio.wait_for(task, 2)
+
+
+# --- forum topics ----------------------------------------------------------------
+
+
+def in_topic(msg_id: int, topic: int, text: str = "hi", reply: int | None = None, **kw: Any) -> Any:
+    """A message in forum topic `topic`, replying to `reply` or to the topic itself."""
+    header = types.MessageReplyHeader(
+        forum_topic=True,
+        reply_to_msg_id=reply or topic,
+        reply_to_top_id=topic if reply else None,
+    )
+    return tg_msg(msg_id, text, reply_to=header, **kw)
+
+
+def test_a_message_in_a_topic_names_its_topic_and_replies_to_nothing():
+    rec = to_record(in_topic(80, 77), "supergroup")
+    assert rec["topic"] == 77
+    assert "reply_to" not in rec  # the topic's own first message is no message to quote
+    rec = to_record(in_topic(81, 77, reply=80), "supergroup")
+    assert rec["topic"] == 77 and rec["reply_to"] == 80
+
+
+def test_a_topic_created_in_the_chat_names_its_title():
+    created = patched.MessageService(
+        id=77,
+        peer_id=types.PeerChannel(CHANNEL_ID),
+        date=datetime(2026, 10, 10, 18, 0, 0, tzinfo=UTC),
+        action=types.MessageActionTopicCreate(title="Release", icon_color=0),
+    )
+    rec = to_record(created, "supergroup")
+    assert rec["action"] == "MessageActionTopicCreate" and rec["topic_title"] == "Release"
+
+
+async def test_topics_are_read_with_their_titles_once():
+    client = FakeClient(
+        [in_topic(80, 77, "release today"), in_topic(81, 77, "which time?", reply=80)]
+    )
+    client.topics = {77: "Release"}
+    backend = backend_for(client)
+    await backend.start()
+    history = await backend.messages_after(CHAT, None, 10)
+    assert [(r["topic"], r.get("topic_title")) for r in history.messages] == [
+        (77, "Release"),
+        (77, "Release"),
+    ]
+    await backend.messages_after(CHAT, 81, 10)
+    await client.arrive(in_topic(82, 77, "at five"))
+    again = await backend.messages_after(CHAT, 81, 10)
+    assert again.messages[0]["topic_title"] == "Release"
+    assert client.topic_reads == [[77]]  # the title is asked for once
+
+
+async def test_the_bridge_puts_topics_in_threads_and_answers_in_them():
+    client = FakeClient([tg_msg(10)])
+    client.topics = {77: "Release"}
+    out = Out()
+    bridge = Bridge(
+        CHAT,
+        out,
+        reconcile_seconds=3600,
+        wait_seconds=5,
+        fresh_grace=0,
+        marker=MARKER,
+        threads=True,
+    )
+    bridge.handle_hub_line(hello(""))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert out.lines[0] == {"type": "hello", "caps": {"personas": "prefix", "threads": "topic"}}
+    await client.arrive(in_topic(80, 77, "release today"))
+    await settle()
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert line["thread"] == {"key": "77", "title": "Release"} and "reply_to" not in line
+    bridge.handle_hub_line(
+        json.dumps(
+            {
+                "type": "out",
+                "id": 5,
+                "author": {"name": "secretary", "kind": "agent"},
+                "text": "at five",
+                "thread": "77",
+            }
+        )
+    )
+    await settle()
+    assert client.sends[-1]["reply_to"] == 77  # into the topic
     bridge.closed.set()
     await asyncio.wait_for(task, 2)

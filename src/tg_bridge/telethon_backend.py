@@ -19,7 +19,7 @@ from typing import Any
 from telethon import TelegramClient, errors, events, utils
 from telethon.errors.common import AuthKeyNotFound
 from telethon.sessions import StringSession
-from telethon.tl import types
+from telethon.tl import functions, types
 
 from tg_bridge.backend import Forwarded, History, Record
 from tg_bridge.config import ConfigError
@@ -171,6 +171,12 @@ def to_record(msg: Any, kind: str) -> Record:
         rec["date"] = _iso(msg.date)
     if isinstance(msg, types.MessageService):
         rec["action"] = type(msg.action).__name__
+        title = getattr(msg.action, "title", None)
+        if (
+            isinstance(msg.action, types.MessageActionTopicCreate | types.MessageActionTopicEdit)
+            and title
+        ):
+            rec["topic_title"] = title  # the bridge learns the topic's title from it
         return rec  # a service message only moves the cursor
     if msg.sender is not None:
         rec["sender_photo"] = photo_rev(msg.sender)
@@ -187,8 +193,14 @@ def to_record(msg: Any, kind: str) -> Record:
             rec["poll"] = {"question": _poll_question(msg)}
     if msg.fwd_from is not None:
         rec["forwarded"] = _forwarded(msg)
-    if msg.reply_to is not None and getattr(msg.reply_to, "reply_to_msg_id", None):
-        rec["reply_to"] = msg.reply_to.reply_to_msg_id
+    reply = msg.reply_to
+    if reply is not None and getattr(reply, "forum_topic", False):
+        # in a forum topic, a message that replies to no message points at the topic itself
+        rec["topic"] = reply.reply_to_top_id or reply.reply_to_msg_id
+        if reply.reply_to_top_id and reply.reply_to_msg_id:
+            rec["reply_to"] = reply.reply_to_msg_id
+    elif reply is not None and getattr(reply, "reply_to_msg_id", None):
+        rec["reply_to"] = reply.reply_to_msg_id
     emojis = [
         {"id": str(e.document_id)}
         for e in msg.entities or []
@@ -222,6 +234,7 @@ class TelethonBackend:
         # The senders read in the chat, newest last: their photos are
         # downloaded through these, which also works for min users.
         self._senders: OrderedDict[int, Any] = OrderedDict()
+        self._topics: dict[int, str] = {}  # forum topic titles by topic id
 
     async def start(self) -> None:
         with telegram_errors("connect"):
@@ -285,12 +298,37 @@ class TelethonBackend:
         for m in messages:
             if m.sender is not None and m.sender_id is not None:
                 self._remember_sender(m.sender_id, m.sender)
+        records = [to_record(m, self._chat_type) for m in messages]
+        await self._name_topics(entity, records)
         return History(
             chat_id=self._chat_id,
             chat_type=self._chat_type,
-            messages=[to_record(m, self._chat_type) for m in messages],
+            messages=records,
             has_more=len(found) >= limit,
         )
+
+    async def _name_topics(self, entity: Any, records: list[Record]) -> None:
+        """Give each record in a topic its topic's title, read from Telegram once
+        per topic and kept; a topic's creation or rename in the chat sets it."""
+        for rec in records:
+            if "action" in rec and rec.get("topic_title"):
+                self._topics[rec["id"]] = rec["topic_title"]
+        unknown = sorted({rec["topic"] for rec in records if "topic" in rec} - self._topics.keys())
+        if unknown:
+            with telegram_errors("read forum topics"):
+                found = await asyncio.wait_for(
+                    self._client(
+                        functions.messages.GetForumTopicsByIDRequest(peer=entity, topics=unknown)
+                    ),
+                    REQUEST_TIMEOUT,
+                )
+            for topic in getattr(found, "topics", []):
+                self._topics[topic.id] = getattr(topic, "title", "") or ""
+            for t in unknown:
+                self._topics.setdefault(t, "")  # a deleted topic is not asked for again
+        for rec in records:
+            if "topic" in rec and "action" not in rec:
+                rec["topic_title"] = self._topics.get(rec["topic"], "")
 
     def _remember_sender(self, sender_id: int, entity: Any) -> None:
         self._senders[sender_id] = entity

@@ -95,4 +95,6 @@ def in_line(rec: dict[str, Any], chat_type: str) -> dict[str, Any]:
         line["reply_to"] = str(rec["reply_to"])
     if rec.get("date"):
         line["at"] = rec["date"]
+    if rec.get("topic"):
+        line["thread"] = {"key": str(rec["topic"]), "title": rec.get("topic_title") or ""}
     return line

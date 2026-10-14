@@ -185,9 +185,12 @@ class Bridge:
         marker: Marker | None = None,
         avatar_window: float = AVATAR_WINDOW_SECONDS,
         avatar_retry: float = AVATAR_RETRY_SECONDS,
+        threads: bool = False,
     ) -> None:
         self.chat = chat
         self.marker = marker or Marker()
+        # whether the backend reports forum topics, which the hub then keeps as threads
+        self.caps = {**CAPS, "threads": "topic"} if threads else CAPS
         self._write = write
         self.reconcile_seconds = reconcile_seconds
         self.wait_seconds = wait_seconds
@@ -245,7 +248,7 @@ class Bridge:
                 self.hello_cursor = self.cursor
                 self._hello_at = time.monotonic()
                 log.info("hello: bridge %s, cursor %s", line.get("bridge"), self.cursor)
-                self.emit({"type": "hello", "caps": CAPS})
+                self.emit({"type": "hello", "caps": self.caps})
             self.hello_seen.set()
         elif kind == "out":
             out_id = _parse_id(line.get("id"))
@@ -435,7 +438,8 @@ class Bridge:
         job = SendJob(
             out_id=out_id,
             chunks=split_message(text),
-            reply_to=_parse_id(line.get("reply_to")),
+            # a message for a topic with nothing to reply to replies to the topic itself
+            reply_to=_parse_id(line.get("reply_to")) or _parse_id(line.get("thread")),
             cursor_before=self.cursor or 0,
             persona=persona(line.get("author")),
         )

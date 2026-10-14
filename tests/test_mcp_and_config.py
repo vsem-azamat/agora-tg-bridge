@@ -324,3 +324,27 @@ async def test_run_exits_2_on_a_configuration_error():
         5,
     )
     assert code == 2
+
+
+async def test_run_declares_threads_only_with_a_backend_that_reports_topics():
+    for args, threads in (
+        (["--chat", str(CHAT), "--backend", "mcp"], None),
+        (["--chat", str(CHAT), "--backend", "telethon"], "topic"),
+    ):
+        tg = FakeTelegram(history=[msg(10)])
+        out = Out()
+
+        async def reader(bridge):
+            bridge.handle_hub_line(hello("10"))
+            await asyncio.sleep(0.05)
+            bridge.closed.set()
+
+        config = parse_args(args)
+        await asyncio.wait_for(
+            run(
+                config, lambda tg=tg: McpBackend(tg), stdin_reader=reader, write=out, fresh_grace=0
+            ),
+            5,
+        )
+        (line,) = out.of("hello")
+        assert line["caps"].get("threads") == threads, config.backend

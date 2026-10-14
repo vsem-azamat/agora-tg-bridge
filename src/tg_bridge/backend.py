@@ -35,6 +35,8 @@ class Record(TypedDict, total=False):
     action: str  # set on service messages
     custom_emojis: list[dict[str, str]]  # [{"id": document id, …}]
     sender_photo: str  # the sender's profile photo by an opaque id, "" for none
+    topic: int  # the forum topic the message is in (its id); absent outside topics
+    topic_title: str  # the topic's title; on a topic's creation, the title it was created with
 
 
 @dataclass(frozen=True)

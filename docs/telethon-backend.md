@@ -30,7 +30,7 @@ The backend keeps the last 2000 senders it read (`SENDERS_KEPT`) and downloads a
 
 ## Sending
 
-`send_message` sends plain text (`parse_mode=None`, so no Markdown is applied), as a reply when `reply_to` is set. With `--custom-emoji-id`, the first character of the message gets a `MessageEntityCustomEmoji` with that document id.
+`send_message` sends plain text (`parse_mode=None`, so no Markdown is applied), as a reply when `reply_to` is set (in a forum, a reply to the topic's id posts into the topic). Records of messages in forum topics carry `topic` and `topic_title`; the titles come from `messages.GetForumTopicsByID`, once per topic and connection (see [Architecture](architecture.md#forum-topics)). With `--custom-emoji-id`, the first character of the message gets a `MessageEntityCustomEmoji` with that document id.
 
 Telethon sleeps through flood waits of up to 60 s (`FLOOD_SLEEP_SECONDS`) and retries server errors itself; the client raises Telegram's own error after its last retry (`raise_last_call_error`). A send waits up to 115 s (`SEND_TIMEOUT`) for its answer.
 
