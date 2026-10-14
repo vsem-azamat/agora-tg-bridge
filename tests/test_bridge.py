@@ -63,13 +63,14 @@ class FakeTelegram:
         # A server whose records name forum topics: titles by topic id. None is a
         # server that does not (its get_messages_after says nothing of `topics`).
         self.topic_titles: dict[int, str] | None = None
+        self.hide_topics_mark = False  # the tool list is older than the server
 
     async def aclose(self) -> None:
         self.closed = True
 
     async def list_tools(self) -> dict[str, str]:
         description = "Messages of a chat newer than `after_id`."
-        if self.topic_titles is not None:
+        if self.topic_titles is not None and not self.hide_topics_mark:
             description += " A forum's records carry `topic`, the result `topics`."
         return {name: description if name == "get_messages_after" else "" for name in self.tools}
 
@@ -1074,7 +1075,7 @@ async def test_a_server_that_does_not_name_topics_keeps_the_room_and_the_caps():
     tg = FakeTelegram(history=[msg(10)])
     bridge, out, task = await started(tg, cursor="10")
 
-    tg.arrive(in_topic_rec(11, 77))
+    tg.arrive(msg(11, "in a forum, but the server names no topic"))
     await settle()
 
     assert len(out.of("hello")) == 1 and "threads" not in out.of("hello")[0]["caps"]
@@ -1097,20 +1098,21 @@ async def test_a_reply_in_a_thread_goes_into_the_topic():
     await stop(bridge, task)
 
 
-async def test_the_caps_follow_a_server_that_restarts_without_topics():
+async def test_a_record_with_a_topic_turns_threads_on_behind_an_old_tool_list():
     tg = FakeTelegram(history=[msg(10)])
     tg.topic_titles = {77: "Release"}
+    tg.hide_topics_mark = True  # the hub still lists the description of the old server
     bridge, out, task = await started(tg, cursor="10")
-    assert out.of("hello")[-1]["caps"].get("threads") == "topic"
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None]
 
-    tg.topic_titles = None  # the server is rolled back and restarts
-    tg.boot = "boot-2"
-    tg.arrive(in_topic_rec(11, 77, "after the rollback"))
+    tg.arrive(in_topic_rec(11, 77, "first in the topic"))
     await settle()
 
-    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic", None]
+    assert [line["caps"].get("threads") for line in out.of("hello")] == [None, "topic"]
     (line,) = [line for line in out.of("in") if "id" in line]
-    assert "thread" not in line
+    assert line["thread"] == {"key": "77", "title": "Release"}
+    # the hello with threads came before the line that needs it
+    assert out.lines.index(out.of("hello")[1]) < out.lines.index(line)
     await stop(bridge, task)
 
 

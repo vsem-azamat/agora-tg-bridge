@@ -38,6 +38,10 @@ class McpClient(Protocol):
     async def aclose(self) -> None: ...
 
 
+def _is_topic(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _short(text: str, limit: int = 200) -> str:
     return " ".join(text.split())[:limit] or "unknown error"
 
@@ -62,12 +66,12 @@ class McpBackend:
         self._photos = PHOTO_TOOL in tools
         if not self._photos:
             log.info("the endpoint does not offer %s: no avatars", PHOTO_TOOL)
-        self._set_topics(tools)
-
-    def _set_topics(self, tools: dict[str, str]) -> None:
-        self.topics = TOPICS_MARK in tools.get("get_messages_after", "")
+        self.topics = TOPICS_MARK in tools["get_messages_after"]
         if not self.topics:
-            log.info("get_messages_after does not name forum topics: a forum is one room")
+            log.info(
+                "get_messages_after does not name forum topics: a forum is one room "
+                "until a record carries a topic"
+            )
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -111,12 +115,14 @@ class McpBackend:
     def _name_topics(self, messages: list[Any], titles: object) -> None:
         """Give each record in a topic its title from the result's `topics` map
         (topic id to title, sent once per result). The General topic is the
-        room's, so its records carry no topic. Records of a server that does not
-        name topics are left as they are."""
-        if not self.topics:
-            for rec in messages:
-                rec.pop("topic", None)
-            return
+        room's, so its records carry no topic. A record with a topic shows that
+        the server names topics even when the hub's tool list does not say so
+        (the hub may keep an older list after the server was updated)."""
+        if not self.topics and (
+            isinstance(titles, dict) or any(_is_topic(r.get("topic")) for r in messages)
+        ):
+            self.topics = True
+            log.info("records carry forum topics")
         names = (
             {str(k): v for k, v in titles.items() if isinstance(v, str)}
             if isinstance(titles, dict)
@@ -124,7 +130,7 @@ class McpBackend:
         )
         for rec in messages:
             topic = rec.get("topic")
-            if not isinstance(topic, int) or isinstance(topic, bool) or topic == GENERAL_TOPIC:
+            if not _is_topic(topic) or topic == GENERAL_TOPIC:
                 rec.pop("topic", None)
             else:
                 rec["topic_title"] = names.get(str(topic), "")
@@ -148,8 +154,6 @@ class McpBackend:
             raise ToolError("unexpected wait_for_events result")
         if result.get("reset") and self._boot is not None:
             log.info("telegram-mcp restarted; reading the chat again")
-            # It may have been updated or rolled back: ask again what it names.
-            self._set_topics(await self._client.list_tools())
         self._boot = result.get("boot") or self._boot
         self._after_seq = int(result.get("last_seq") or 0)
         return bool(result.get("events") or result.get("gap") or result.get("reset"))

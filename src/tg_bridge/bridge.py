@@ -309,7 +309,10 @@ class Bridge:
 
     async def _messages_after(self, after_id: int | None, limit: int) -> History:
         chat = self.chat_id if self.chat_id is not None else self.chat
-        return await self._backend.messages_after(chat, after_id, limit)
+        history = await self._backend.messages_after(chat, after_id, limit)
+        # A backend may find out from its records that it names topics.
+        self._declare_threads(self._backend.topics)
+        return history
 
     def _line_for(self, rec: dict[str, Any]) -> dict[str, Any]:
         if rec["id"] in self._own:
@@ -422,10 +425,7 @@ class Bridge:
         return emitted
 
     async def _poll_events(self, timeout: float) -> bool:
-        woke = await self._backend.wait_for_events(self.chat_id, timeout)
-        # A server that restarted may name topics differently than before.
-        self._declare_threads(self._backend.topics)
-        return woke
+        return await self._backend.wait_for_events(self.chat_id, timeout)
 
     # --- Telegram side: sending -------------------------------------------
 
