@@ -83,6 +83,18 @@ def telegram_errors(what: str) -> Iterator[None]:
         raise TransportError(f"{what}: {type(exc).__name__}") from exc
 
 
+def _topic_of(reply: Any) -> int | None:
+    """The forum topic a message with this reply header is in, or None. In a
+    topic, a message that replies to no message points at the topic itself."""
+    if reply is None or not getattr(reply, "forum_topic", False):
+        return None
+    if getattr(reply, "reply_to_top_id", None):
+        return reply.reply_to_top_id
+    if getattr(reply, "reply_to_peer_id", None) is None:
+        return getattr(reply, "reply_to_msg_id", None) or None
+    return None
+
+
 def chat_type(entity: Any) -> str:
     if isinstance(entity, types.User):
         return "private"
@@ -172,11 +184,14 @@ def to_record(msg: Any, kind: str) -> Record:
     if isinstance(msg, types.MessageService):
         rec["action"] = type(msg.action).__name__
         title = getattr(msg.action, "title", None)
-        if (
-            isinstance(msg.action, types.MessageActionTopicCreate | types.MessageActionTopicEdit)
-            and title
-        ):
-            rec["topic_title"] = title  # the bridge learns the topic's title from it
+        if isinstance(msg.action, types.MessageActionTopicCreate) and title:
+            # a topic's id is the id of the message that created it
+            rec["topic"], rec["topic_title"] = msg.id, title
+        elif isinstance(msg.action, types.MessageActionTopicEdit) and title:
+            # a rename is a message in the topic it renames
+            topic = _topic_of(msg.reply_to)
+            if topic is not None:
+                rec["topic"], rec["topic_title"] = topic, title
         return rec  # a service message only moves the cursor
     if msg.sender is not None:
         rec["sender_photo"] = photo_rev(msg.sender)
@@ -194,12 +209,16 @@ def to_record(msg: Any, kind: str) -> Record:
     if msg.fwd_from is not None:
         rec["forwarded"] = _forwarded(msg)
     reply = msg.reply_to
-    if reply is not None and getattr(reply, "forum_topic", False):
-        # in a forum topic, a message that replies to no message points at the topic itself
-        rec["topic"] = reply.reply_to_top_id or reply.reply_to_msg_id
-        if reply.reply_to_top_id and reply.reply_to_msg_id:
-            rec["reply_to"] = reply.reply_to_msg_id
-    elif reply is not None and getattr(reply, "reply_to_msg_id", None):
+    topic = _topic_of(reply)
+    if topic is not None:
+        rec["topic"] = topic
+    # A reply to a message of another chat names an id of that chat, not of this one.
+    if (
+        reply is not None
+        and getattr(reply, "reply_to_peer_id", None) is None
+        and getattr(reply, "reply_to_msg_id", None)
+        and reply.reply_to_msg_id != topic
+    ):
         rec["reply_to"] = reply.reply_to_msg_id
     emojis = [
         {"id": str(e.document_id)}
@@ -309,23 +328,32 @@ class TelethonBackend:
 
     async def _name_topics(self, entity: Any, records: list[Record]) -> None:
         """Give each record in a topic its topic's title, read from Telegram once
-        per topic and kept; a topic's creation or rename in the chat sets it."""
+        per topic and kept; a topic's creation or rename in the chat sets it.
+        The title is only a name: when Telegram refuses to say it, the topic
+        goes without one, and reading carries on."""
         for rec in records:
-            if "action" in rec and rec.get("topic_title"):
-                self._topics[rec["id"]] = rec["topic_title"]
+            if "action" in rec and rec.get("topic_title") and "topic" in rec:
+                self._topics[rec["topic"]] = rec["topic_title"]
         unknown = sorted({rec["topic"] for rec in records if "topic" in rec} - self._topics.keys())
         if unknown:
-            with telegram_errors("read forum topics"):
-                found = await asyncio.wait_for(
-                    self._client(
-                        functions.messages.GetForumTopicsByIDRequest(peer=entity, topics=unknown)
-                    ),
-                    REQUEST_TIMEOUT,
-                )
-            for topic in getattr(found, "topics", []):
+            try:
+                with telegram_errors("read forum topics"):
+                    found = await asyncio.wait_for(
+                        self._client(
+                            functions.messages.GetForumTopicsByIDRequest(
+                                peer=entity, topics=unknown
+                            )
+                        ),
+                        REQUEST_TIMEOUT,
+                    )
+            except (ToolError, ChatAccessError) as exc:
+                log.warning("titles of %d forum topic(s) not read: %s", len(unknown), exc)
+                found = None
+            for topic in getattr(found, "topics", None) or []:
                 self._topics[topic.id] = getattr(topic, "title", "") or ""
             for t in unknown:
-                self._topics.setdefault(t, "")  # a deleted topic is not asked for again
+                # a deleted or refused topic is not asked for again
+                self._topics.setdefault(t, "")
         for rec in records:
             if "topic" in rec and "action" not in rec:
                 rec["topic_title"] = self._topics.get(rec["topic"], "")
