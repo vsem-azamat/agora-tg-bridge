@@ -4,7 +4,7 @@
 
 The bridge is one process per bridged chat, connected to Telegram through a backend: [Telethon](telethon-backend.md) (its own login) or [MCP](mcp-backend.md) (telegram-mcp behind an MCP hub). Both give the bridge the same message records, events and sends (`backend.Backend`), so everything below holds for either.
 
-The Agora hub starts the bridge, writes `hello` and `out` lines to its standard input and reads `in`, `avatar`, `sent` and `failed` lines from its standard output; its standard error goes to the hub's log.
+The Agora hub starts the bridge, writes `hello` and `out` lines to its standard input and reads `hello`, `in`, `avatar`, `sent` and `failed` lines from its standard output; its standard error goes to the hub's log.
 
 | Module | Holds |
 | --- | --- |
@@ -23,7 +23,7 @@ The Agora hub starts the bridge, writes `hello` and `out` lines to its standard 
 
 ## Start
 
-The bridge waits for `hello`, starts the backend (Telethon: connects and checks the session is logged in; MCP: checks that the endpoint offers the tools it needs) and resolves the chat. A fresh process then waits 1.5 s (`FRESH_GRACE_SECONDS`), so messages the hub hands again after a restart are matched against the chat before it is read.
+The bridge waits for `hello` and answers it with its own `{"type":"hello","caps":{"personas":"prefix"}}`: it shows who writes by naming the agent in the text after the prefix. It then starts the backend (Telethon: connects and checks the session is logged in; MCP: checks that the endpoint offers the tools it needs) and resolves the chat. A fresh process then waits 1.5 s (`FRESH_GRACE_SECONDS`), so messages the hub hands again after a restart are matched against the chat before it is read.
 
 - With an empty cursor it starts after the newest message (no history import) and reports that position as a cursor-only `in` line.
 - With a cursor (a Telegram message id) it reads every message after it, in pages of 100.
@@ -51,7 +51,7 @@ Avatar lines are written by their own loop, outside the chat lock, at most 30 in
 
 ## Outbound
 
-Each `out` line becomes a send job: one send per part, as plain text starting with the prefix (its first character as the custom emoji when `--custom-emoji-id` is set), the first part as a reply when `reply_to` names a Telegram message. Text over 4000 UTF-16 units (`MAX_MESSAGE_UTF16`) is split at line breaks or spaces into several messages, each with the prefix.
+Each `out` line becomes a send job: one send per part, as plain text starting with the prefix (its first character as the custom emoji when `--custom-emoji-id` is set), the first part as a reply when `reply_to` names a Telegram message. When the line's author is an agent (any `kind` but `human`), every part names it after the prefix: `🤖 secretary: …`, from the author's `display` (else `name`, when `display` has nothing visible), on one line and cut to 32 UTF-16 units, Agora's longest agent name (`persona`, `MAX_PERSONA_UTF16`). The operator's messages (`kind` `human`) carry the prefix alone. Text over 3998 UTF-16 units (`MAX_MESSAGE_UTF16`: Telegram's 4096 less the longest prefix, name and `: `) is split at line breaks or spaces into several messages, each with the prefix and the name.
 
 The bridge answers `sent` with the first message id (without `ext_id` when the server named none) before any read of the chat can see it: reads and sends share one lock. Its own messages coming back only move the cursor. An `out` id handed twice in one process is sent once.
 
@@ -66,7 +66,7 @@ The bridge never sends a message twice and never answers blindly, within these r
 - **Lost answers.** A send waits up to 115 s for its answer (Telethon, in either backend, may sleep through a 60 s flood wait). When a call gets no answer, the bridge does not answer either: it reconnects and looks in the chat, then once more after 65 s (`RECHECK_SECONDS`), and answers `sent` if the message is there or `failed` if it is not. The second check holds the chat lock, so incoming messages wait for it too.
 - **Stopping.** On `SIGTERM` a send in flight is finished (for up to 4 s; the hub kills the bridge 5 s after `SIGTERM`) before the process exits.
 
-Limits: the check matches text and `reply_to`. A message the hub hands more than 30 s after `hello` is always sent; if an earlier process had already delivered it, it goes out twice. With the MCP backend, messages the same account sends through other telegram-mcp clients produce no event; they arrive with the next safety read.
+Limits: the check matches text and `reply_to`, the name included: a copy sent under another name (by a version of the bridge that did not name agents, or before the agent was renamed) is not found, and the message goes out a second time. A message the hub hands more than 30 s after `hello` is always sent; if an earlier process had already delivered it, it goes out twice. With the MCP backend, messages the same account sends through other telegram-mcp clients produce no event; they arrive with the next safety read.
 
 ## Failures
 

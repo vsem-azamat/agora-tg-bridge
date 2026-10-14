@@ -20,7 +20,7 @@ from telethon.errors import rpc_message_to_error
 from telethon.errors.common import AuthKeyNotFound
 from telethon.tl import patched, types
 
-from tests.test_bridge import Out, hello, out_line, settle
+from tests.test_bridge import Out, agent_out, hello, out_line, settle
 from tg_bridge.bridge import AVATAR_LINES, MAX_AVATAR_BYTES, Bridge, Marker
 from tg_bridge.cli import main, run
 from tg_bridge.config import ROBOT, ConfigError, parse_args
@@ -455,7 +455,10 @@ async def test_bridge_reads_sends_and_skips_its_echo():
     bridge.handle_hub_line(hello(""))
     task = asyncio.create_task(bridge.serve(backend_for(client)))
     await settle()
-    assert out.lines == [{"type": "in", "cursor": "10"}]
+    assert out.lines == [
+        {"type": "hello", "caps": {"personas": "prefix"}},
+        {"type": "in", "cursor": "10"},
+    ]
 
     await client.arrive(tg_msg(11, "question", mentioned=True))
     await settle()
@@ -468,8 +471,9 @@ async def test_bridge_reads_sends_and_skips_its_echo():
     }
     assert line["addressed"] is True and line["text"] == "question"
 
-    bridge.handle_hub_line(out_line(318, "answer", reply_to="11"))
+    bridge.handle_hub_line(agent_out(318, "answer", reply_to="11"))
     await settle()
+    assert client.sends[-1]["text"] == f"{ROBOT} secretary: answer"
     assert out.of("sent") == [{"type": "sent", "id": 318, "ext_id": "1001"}]
     assert out.lines[-1] == {"type": "in", "cursor": "1001"}  # the echo only moves the cursor
 
