@@ -493,7 +493,7 @@ async def test_bridge_reads_sends_and_skips_its_echo():
     task = asyncio.create_task(bridge.serve(backend_for(client)))
     await settle()
     assert out.lines == [
-        {"type": "hello", "caps": {"personas": "prefix"}},
+        {"type": "hello", "version": 3, "caps": {"personas": "prefix"}},
         {"type": "in", "cursor": "10"},
     ]
 
@@ -966,7 +966,11 @@ async def test_the_bridge_puts_topics_in_threads_and_answers_in_them():
     bridge.handle_hub_line(hello(""))
     task = asyncio.create_task(bridge.serve(backend_for(client)))
     await settle()
-    assert out.lines[0] == {"type": "hello", "caps": {"personas": "prefix", "threads": "topic"}}
+    assert out.lines[0] == {
+        "type": "hello",
+        "version": 3,
+        "caps": {"personas": "prefix", "threads": "topic"},
+    }
     await client.arrive(in_topic(80, 77, "release today"))
     await settle()
     (line,) = [line for line in out.of("in") if "id" in line]

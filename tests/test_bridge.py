@@ -197,7 +197,7 @@ async def test_first_start_begins_after_the_newest_message():
     bridge, out, task = await started(tg)
 
     assert out.lines == [
-        {"type": "hello", "caps": {"personas": "prefix"}},
+        {"type": "hello", "version": 3, "caps": {"personas": "prefix"}},
         {"type": "in", "cursor": "11"},
     ]
     assert bridge.chat_id == CHAT
@@ -896,7 +896,7 @@ async def test_hello_declares_personas_by_prefix():
     tg = FakeTelegram(history=[msg(10)])
     bridge, out, task = await started(tg, cursor="10")
 
-    assert out.of("hello") == [{"type": "hello", "caps": {"personas": "prefix"}}]
+    assert out.of("hello") == [{"type": "hello", "version": 3, "caps": {"personas": "prefix"}}]
     bridge.handle_hub_line(hello("10"))  # a second hello is not answered again
     assert len(out.of("hello")) == 1
     await stop(bridge, task)

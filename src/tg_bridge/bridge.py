@@ -42,6 +42,7 @@ MAX_PERSONA_UTF16 = 32  # Agora's longest agent name
 PERSONA_SEPARATOR = ": "  # between the persona and the text
 # Telegram allows 4096; leave room for the longest prefix, persona and separator.
 MAX_MESSAGE_UTF16 = 4096 - MAX_PREFIX_UTF16 - MAX_PERSONA_UTF16 - utf16_len(PERSONA_SEPARATOR)
+PROTOCOL_VERSION = 3  # the Agora bridge protocol version this bridge speaks, sent in `hello`
 CAPS = {"personas": "prefix"}  # agents are named in the text after the prefix
 HISTORY_PAGE = 100
 DELIVERY_CHECK_PAGES = 10
@@ -263,7 +264,7 @@ class Bridge:
                 self.hello_cursor = self.cursor
                 self._hello_at = time.monotonic()
                 log.info("hello: bridge %s, cursor %s", line.get("bridge"), self.cursor)
-                self.emit({"type": "hello", "caps": self.caps})
+                self.emit({"type": "hello", "version": PROTOCOL_VERSION, "caps": self.caps})
             self.hello_seen.set()
         elif kind == "out":
             out_id = _parse_id(line.get("id"))
