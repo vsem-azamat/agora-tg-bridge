@@ -170,6 +170,21 @@ class SendJob:
     claim_from: int | None = None  # look in the chat after this id before sending
     uncertain: bool = False  # part `done` may have gone out; its call got no answer
     persona: str = ""  # the agent named after the prefix in every part
+    topic: int | None = None  # the forum topic every part goes into
+
+    def reply_for(self, part: int) -> int | None:
+        """What part `part` is sent as a reply to: the first part to `reply_to`,
+        every part of a message for a topic at least to the topic itself."""
+        if part == 0 and self.reply_to is not None:
+            return self.reply_to
+        return self.topic
+
+    def copy_reply(self, part: int) -> int | None:
+        """The `reply_to` Telegram's copy of part `part` reads back with: a
+        message sent to the topic itself comes back as a topic message that
+        replies to nothing."""
+        reply = self.reply_for(part)
+        return None if reply is not None and reply == self.topic else reply
 
 
 class Bridge:
@@ -185,9 +200,12 @@ class Bridge:
         marker: Marker | None = None,
         avatar_window: float = AVATAR_WINDOW_SECONDS,
         avatar_retry: float = AVATAR_RETRY_SECONDS,
+        threads: bool = False,
     ) -> None:
         self.chat = chat
         self.marker = marker or Marker()
+        # whether the backend reports forum topics, which the hub then keeps as threads
+        self.caps = {**CAPS, "threads": "topic"} if threads else CAPS
         self._write = write
         self.reconcile_seconds = reconcile_seconds
         self.wait_seconds = wait_seconds
@@ -245,7 +263,7 @@ class Bridge:
                 self.hello_cursor = self.cursor
                 self._hello_at = time.monotonic()
                 log.info("hello: bridge %s, cursor %s", line.get("bridge"), self.cursor)
-                self.emit({"type": "hello", "caps": CAPS})
+                self.emit({"type": "hello", "caps": self.caps})
             self.hello_seen.set()
         elif kind == "out":
             out_id = _parse_id(line.get("id"))
@@ -412,8 +430,9 @@ class Bridge:
                     self.marker.text(job.chunks[job.done], job.persona)
                 ):
                     continue
-                expected_reply = job.reply_to if job.done == 0 else None
-                if _parse_id(rec.get("reply_to")) != expected_reply:
+                if _parse_id(rec.get("reply_to")) != job.copy_reply(job.done):
+                    continue
+                if rec.get("topic") != job.topic:  # a topic's copy, or a room's, only
                     continue
                 job.ids.append(rec["id"])
                 self._remember_own(rec["id"])
@@ -438,6 +457,7 @@ class Bridge:
             reply_to=_parse_id(line.get("reply_to")),
             cursor_before=self.cursor or 0,
             persona=persona(line.get("author")),
+            topic=_parse_id(line.get("thread")),
         )
         if line.get("_maybe_earlier"):
             # Possibly sent by an earlier process: its copy may already be
@@ -474,7 +494,7 @@ class Bridge:
                 msg_id = await self._backend.send(
                     self.chat_id,
                     self.marker.text(job.chunks[job.done], job.persona),
-                    reply_to=job.reply_to if job.done == 0 else None,
+                    reply_to=job.reply_for(job.done),
                     custom_emoji_id=self.marker.custom_emoji_id,
                 )
             except (TransportError, asyncio.CancelledError):

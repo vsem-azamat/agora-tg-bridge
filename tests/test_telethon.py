@@ -239,6 +239,10 @@ class FakeClient:
         self.photo_errors: list[BaseException] = []  # raised once each, first
         self.photo_gate: asyncio.Event | None = None  # downloads wait for it
         self.downloads: list[tuple[Any, Any, bool]] = []
+        self.topics: dict[int, str] = {}  # forum topic titles by topic id
+        self.topic_reads: list[list[int]] = []
+        self.topic_error: BaseException | None = None  # the title lookup is refused
+        self.forum = False  # sends land in topics as in a forum
 
     async def connect(self) -> None:
         self.connected = True
@@ -286,6 +290,39 @@ class FakeClient:
             raise self.photo_error
         return self.photos.get(entity if isinstance(entity, int) else entity.id)
 
+    async def __call__(self, request: Any) -> Any:
+        if type(request).__name__ == "GetForumTopicsByIDRequest":
+            self.topic_reads.append(list(request.topics))
+            if self.topic_error is not None:
+                raise self.topic_error
+            return SimpleNamespace(
+                topics=[
+                    SimpleNamespace(id=t, title=self.topics[t])
+                    for t in request.topics
+                    if t in self.topics
+                ]
+            )
+        raise AssertionError(type(request).__name__)
+
+    def _reply_header(self, reply: int | None) -> Any:
+        """The reply header Telegram gives a message sent as a reply to `reply`:
+        in a forum, a reply to a topic's first message lands in the topic and
+        replies to nothing, and a reply to a message in a topic stays in it."""
+        if not reply:
+            return None
+        if not self.forum:
+            return types.MessageReplyHeader(reply_to_msg_id=reply)
+        if reply in self.topics:
+            return types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=reply)
+        target = next((m for m in self.history if m.id == reply), None)
+        header = getattr(target, "reply_to", None)
+        if header is not None and header.forum_topic:
+            top = header.reply_to_top_id or header.reply_to_msg_id
+            return types.MessageReplyHeader(
+                forum_topic=True, reply_to_msg_id=reply, reply_to_top_id=top
+            )
+        return types.MessageReplyHeader(reply_to_msg_id=reply)
+
     async def arrive(self, msg: Any) -> None:
         self.history.append(msg)
         for handler in self.handlers:
@@ -305,7 +342,7 @@ class FakeClient:
             sender=ME,
             out=True,
             entities=kw.get("formatting_entities"),
-            reply_to=types.MessageReplyHeader(reply_to_msg_id=reply) if reply else None,
+            reply_to=self._reply_header(reply),
         )
         self.history.append(msg)
         if self.send_error:
@@ -860,3 +897,345 @@ async def test_avatars_still_waiting_are_sent_after_a_reconnect():
 async def stop_bridge(bridge: Bridge, task: asyncio.Task) -> None:
     bridge.closed.set()
     await asyncio.wait_for(task, 2)
+
+
+# --- forum topics ----------------------------------------------------------------
+
+
+def in_topic(msg_id: int, topic: int, text: str = "hi", reply: int | None = None, **kw: Any) -> Any:
+    """A message in forum topic `topic`, replying to `reply` or to the topic itself."""
+    header = types.MessageReplyHeader(
+        forum_topic=True,
+        reply_to_msg_id=reply or topic,
+        reply_to_top_id=topic if reply else None,
+    )
+    return tg_msg(msg_id, text, reply_to=header, **kw)
+
+
+def test_a_message_in_a_topic_names_its_topic_and_replies_to_nothing():
+    rec = to_record(in_topic(80, 77), "supergroup")
+    assert rec["topic"] == 77
+    assert "reply_to" not in rec  # the topic's own first message is no message to quote
+    rec = to_record(in_topic(81, 77, reply=80), "supergroup")
+    assert rec["topic"] == 77 and rec["reply_to"] == 80
+
+
+def test_a_topic_created_in_the_chat_names_its_title():
+    created = patched.MessageService(
+        id=77,
+        peer_id=types.PeerChannel(CHANNEL_ID),
+        date=datetime(2026, 10, 10, 18, 0, 0, tzinfo=UTC),
+        action=types.MessageActionTopicCreate(title="Release", icon_color=0),
+    )
+    rec = to_record(created, "supergroup")
+    assert rec["action"] == "MessageActionTopicCreate" and rec["topic_title"] == "Release"
+
+
+async def test_topics_are_read_with_their_titles_once():
+    client = FakeClient(
+        [in_topic(80, 77, "release today"), in_topic(81, 77, "which time?", reply=80)]
+    )
+    client.topics = {77: "Release"}
+    backend = backend_for(client)
+    await backend.start()
+    history = await backend.messages_after(CHAT, None, 10)
+    assert [(r["topic"], r.get("topic_title")) for r in history.messages] == [
+        (77, "Release"),
+        (77, "Release"),
+    ]
+    await backend.messages_after(CHAT, 81, 10)
+    await client.arrive(in_topic(82, 77, "at five"))
+    again = await backend.messages_after(CHAT, 81, 10)
+    assert again.messages[0]["topic_title"] == "Release"
+    assert client.topic_reads == [[77]]  # the title is asked for once
+
+
+async def test_the_bridge_puts_topics_in_threads_and_answers_in_them():
+    client = FakeClient([tg_msg(10)])
+    client.topics = {77: "Release"}
+    out = Out()
+    bridge = Bridge(
+        CHAT,
+        out,
+        reconcile_seconds=3600,
+        wait_seconds=5,
+        fresh_grace=0,
+        marker=MARKER,
+        threads=True,
+    )
+    bridge.handle_hub_line(hello(""))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert out.lines[0] == {"type": "hello", "caps": {"personas": "prefix", "threads": "topic"}}
+    await client.arrive(in_topic(80, 77, "release today"))
+    await settle()
+    (line,) = [line for line in out.of("in") if "id" in line]
+    assert line["thread"] == {"key": "77", "title": "Release"} and "reply_to" not in line
+    bridge.handle_hub_line(
+        json.dumps(
+            {
+                "type": "out",
+                "id": 5,
+                "author": {"name": "secretary", "kind": "agent"},
+                "text": "at five",
+                "thread": "77",
+            }
+        )
+    )
+    await settle()
+    assert client.sends[-1]["reply_to"] == 77  # into the topic
+    bridge.closed.set()
+    await asyncio.wait_for(task, 2)
+
+
+def topic_out(out_id: int, text: str, thread: str = "77", **extra: Any) -> str:
+    author = {"name": "secretary", "kind": "agent", "display": "secretary"}
+    line = {"type": "out", "id": out_id, "author": author, "text": text, "thread": thread}
+    return json.dumps({**line, **extra})
+
+
+def forum_client(*history: Any) -> FakeClient:
+    client = FakeClient([tg_msg(10), *history])
+    client.topics = {77: "Release"}
+    client.forum = True
+    return client
+
+
+def forum_bridge(out: Out, **kw: Any) -> Bridge:
+    return Bridge(
+        CHAT,
+        out,
+        reconcile_seconds=3600,
+        wait_seconds=5,
+        fresh_grace=0,
+        recheck_seconds=0.01,
+        marker=MARKER,
+        threads=True,
+        **kw,
+    )
+
+
+async def test_every_part_of_a_long_reply_goes_into_the_topic():
+    client = forum_client(in_topic(80, 77, "release today"))
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    bridge.handle_hub_line(topic_out(5, "a" * 3000 + "\n" + "b" * 3000, reply_to="80"))
+    await settle()
+    assert [s["reply_to"] for s in client.sends] == [80, 77]  # the second part into the topic
+    sent = [m for m in client.history if m.out]
+    assert all(to_record(m, "supergroup")["topic"] == 77 for m in sent)
+    assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": str(sent[0].id)}]
+    await stop_bridge(bridge, task)
+
+
+async def test_a_lost_send_into_the_topic_is_found_in_the_chat():
+    client = forum_client(in_topic(80, 77, "release today"))
+    client.send_error = ConnectionError("reset")
+    client.deliver_despite_error = True
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    bridge.handle_hub_line(topic_out(5, "at five"))
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(task, 2)
+    client.send_error = None
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert len(client.sends) == 1  # found, not sent again
+    assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": "1001"}]
+    assert not out.of("failed")
+    await stop_bridge(bridge, task)
+
+
+async def test_a_copy_an_earlier_process_sent_into_the_topic_is_claimed():
+    earlier = tg_msg(
+        81,
+        f"{ROBOT} secretary: at five",
+        sender=ME,
+        out=True,
+        entities=[types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))],
+        reply_to=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77),
+    )
+    client = forum_client(in_topic(80, 77, "release today"), earlier)
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    bridge.handle_hub_line(topic_out(5, "at five"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert client.sends == []
+    assert out.of("sent") == [{"type": "sent", "id": 5, "ext_id": "81"}]
+    await stop_bridge(bridge, task)
+
+
+async def test_a_copy_in_another_topic_is_not_claimed():
+    elsewhere = tg_msg(
+        81,
+        f"{ROBOT} secretary: at five",
+        sender=ME,
+        out=True,
+        entities=[types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))],
+        reply_to=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=78),
+    )
+    client = forum_client(in_topic(80, 77, "release today"), elsewhere)
+    client.topics[78] = "Other"
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    bridge.handle_hub_line(topic_out(5, "at five"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert [s["reply_to"] for s in client.sends] == [77]
+    await stop_bridge(bridge, task)
+
+
+def topic_service(msg_id: int, action: Any, reply_to: Any = None) -> Any:
+    return patched.MessageService(
+        id=msg_id,
+        peer_id=types.PeerChannel(CHANNEL_ID),
+        date=datetime(2026, 10, 10, 18, 0, 0, tzinfo=UTC),
+        action=action,
+        reply_to=reply_to,
+    )
+
+
+async def test_a_topic_created_in_the_read_is_not_looked_up():
+    created = topic_service(77, types.MessageActionTopicCreate(title="Release", icon_color=0))
+    client = FakeClient([created, in_topic(80, 77, "release today")])
+    backend = backend_for(client)
+    await backend.start()
+    history = await backend.messages_after(CHAT, 1, 10)
+    assert history.messages[-1]["topic_title"] == "Release"
+    assert client.topic_reads == []
+
+
+async def test_a_rename_in_the_chat_renames_the_topic_it_is_in():
+    client = FakeClient([in_topic(80, 77, "release today")])
+    client.topics = {77: "Release"}
+    backend = backend_for(client)
+    await backend.start()
+    await backend.messages_after(CHAT, 1, 10)
+    renamed = topic_service(
+        90,
+        types.MessageActionTopicEdit(title="Release 2"),
+        types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77),
+    )
+    await client.arrive(renamed)
+    await client.arrive(in_topic(91, 77, "moved to friday"))
+    history = await backend.messages_after(CHAT, 80, 10)
+    assert history.messages[-1]["topic_title"] == "Release 2"
+    assert client.topic_reads == [[77]]
+
+
+async def test_an_edit_without_a_title_keeps_the_title():
+    client = FakeClient([in_topic(80, 77, "release today")])
+    client.topics = {77: "Release"}
+    backend = backend_for(client)
+    await backend.start()
+    await backend.messages_after(CHAT, 1, 10)
+    closed = topic_service(
+        90,
+        types.MessageActionTopicEdit(closed=True),
+        types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77),
+    )
+    await client.arrive(closed)
+    await client.arrive(in_topic(91, 77, "closed"))
+    history = await backend.messages_after(CHAT, 80, 10)
+    assert history.messages[-1]["topic_title"] == "Release"
+
+
+async def test_a_deleted_topic_is_asked_for_once_and_goes_without_a_title():
+    client = FakeClient([in_topic(80, 77, "release today")])  # 77 no longer exists
+    backend = backend_for(client)
+    await backend.start()
+    history = await backend.messages_after(CHAT, 1, 10)
+    assert history.messages[0]["topic_title"] == ""
+    await client.arrive(in_topic(81, 77, "again"))
+    await backend.messages_after(CHAT, 80, 10)
+    assert client.topic_reads == [[77]]
+
+
+async def test_a_refused_title_lookup_does_not_stop_reading():
+    client = FakeClient([in_topic(80, 77, "release today"), tg_msg(81, "elsewhere")])
+    client.topic_error = rpc_error(400, "CHANNEL_FORUM_MISSING")
+    backend = backend_for(client)
+    await backend.start()
+    history = await backend.messages_after(CHAT, 1, 10)
+    assert [(r["id"], r.get("topic_title")) for r in history.messages] == [(80, ""), (81, None)]
+
+
+async def test_a_refused_title_lookup_does_not_stop_the_bridge_starting():
+    client = FakeClient([in_topic(80, 77, "release today")])
+    client.topic_error = rpc_error(400, "CHANNEL_FORUM_MISSING")
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello(""))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert not task.done()
+    assert {"type": "in", "cursor": "80"} in out.lines
+    await stop_bridge(bridge, task)
+
+
+def test_a_reply_to_another_chats_message_replies_to_nothing_here():
+    other = types.PeerChannel(CHANNEL_ID + 1)
+    plain = tg_msg(
+        81, "see this", reply_to=types.MessageReplyHeader(reply_to_msg_id=5, reply_to_peer_id=other)
+    )
+    assert "reply_to" not in to_record(plain, "supergroup")
+    in_77 = tg_msg(
+        82,
+        "see this",
+        reply_to=types.MessageReplyHeader(
+            forum_topic=True, reply_to_msg_id=5, reply_to_peer_id=other, reply_to_top_id=77
+        ),
+    )
+    rec = to_record(in_77, "supergroup")
+    assert rec["topic"] == 77 and "reply_to" not in rec
+
+
+async def test_a_copy_in_the_general_topic_is_not_claimed_for_a_topic():
+    general = tg_msg(
+        81,
+        f"{ROBOT} secretary: at five",
+        sender=ME,
+        out=True,
+        entities=[types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))],
+    )
+    client = forum_client(in_topic(80, 77, "release today"), general)
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    bridge.handle_hub_line(topic_out(5, "at five"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert [s["reply_to"] for s in client.sends] == [77]
+    await stop_bridge(bridge, task)
+
+
+async def test_a_copy_in_a_topic_is_not_claimed_for_the_room():
+    in_77 = tg_msg(
+        81,
+        f"{ROBOT} secretary: at five",
+        sender=ME,
+        out=True,
+        entities=[types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))],
+        reply_to=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77),
+    )
+    client = forum_client(in_topic(80, 77, "release today"), in_77)
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    author = {"name": "secretary", "kind": "agent", "display": "secretary"}
+    bridge.handle_hub_line(
+        json.dumps({"type": "out", "id": 5, "author": author, "text": "at five"})
+    )
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert len(client.sends) == 1 and client.sends[0].get("reply_to") is None
+    await stop_bridge(bridge, task)
