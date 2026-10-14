@@ -126,15 +126,17 @@ class McpHttpClient:
             return message.get("result") or {}
         raise TransportError(f"{method} failed")
 
-    async def list_tools(self) -> list[str]:
-        names: list[str] = []
+    async def list_tools(self) -> dict[str, str]:
+        """The tools the endpoint offers: name to description."""
+        tools: dict[str, str] = {}
         cursor = None
         while True:
             result = await self._request("tools/list", {"cursor": cursor} if cursor else {}, 30.0)
-            names.extend(t.get("name", "") for t in result.get("tools", []))
+            for tool in result.get("tools", []):
+                tools[tool.get("name", "")] = str(tool.get("description") or "")
             cursor = result.get("nextCursor")
             if not cursor:
-                return names
+                return tools
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any], *, read_timeout: float = 60.0

@@ -237,6 +237,8 @@ def to_record(msg: Any, kind: str) -> Record:
 
 
 class TelethonBackend:
+    topics = True  # its records name forum topics
+
     def __init__(
         self,
         session: SessionData,

@@ -103,14 +103,14 @@ async def test_unreachable_hub_is_a_transport_error():
 async def test_list_tools_follows_pages():
     pages = iter(
         [
-            {"result": {"tools": [{"name": "a"}], "nextCursor": "p2"}},
+            {"result": {"tools": [{"name": "a", "description": "x"}], "nextCursor": "p2"}},
             {"result": {"tools": [{"name": "b"}]}},
         ]
     )
     handler, _ = server(lambda body: next(pages))
     client = McpHttpClient(URL, "tok", transport=httpx.MockTransport(handler))
 
-    assert await client.list_tools() == ["a", "b"]
+    assert await client.list_tools() == {"a": "x", "b": ""}
     await client.aclose()
 
 
@@ -326,12 +326,14 @@ async def test_run_exits_2_on_a_configuration_error():
     assert code == 2
 
 
-async def test_run_declares_threads_only_with_a_backend_that_reports_topics():
-    for args, threads in (
-        (["--chat", str(CHAT), "--backend", "mcp"], None),
-        (["--chat", str(CHAT), "--backend", "telethon"], "topic"),
+async def test_run_declares_threads_for_telethon_and_for_an_mcp_server_that_names_topics():
+    for args, titles, threads in (
+        (["--chat", str(CHAT), "--backend", "mcp"], None, None),
+        (["--chat", str(CHAT), "--backend", "mcp"], {77: "Release"}, "topic"),
+        (["--chat", str(CHAT), "--backend", "telethon"], None, "topic"),
     ):
         tg = FakeTelegram(history=[msg(10)])
+        tg.topic_titles = titles
         out = Out()
 
         async def reader(bridge):
@@ -346,5 +348,4 @@ async def test_run_declares_threads_only_with_a_backend_that_reports_topics():
             ),
             5,
         )
-        (line,) = out.of("hello")
-        assert line["caps"].get("threads") == threads, config.backend
+        assert out.of("hello")[-1]["caps"].get("threads") == threads, (config.backend, titles)

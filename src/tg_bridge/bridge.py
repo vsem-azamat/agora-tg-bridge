@@ -205,7 +205,9 @@ class Bridge:
     ) -> None:
         self.chat = chat
         self.marker = marker or Marker()
-        # whether the backend reports forum topics, which the hub then keeps as threads
+        # whether forum topics are threads: declared from the start, or once the
+        # backend says its records name topics (see `_declare_threads`)
+        self._threads = threads
         self.caps = {**CAPS, "threads": "topic"} if threads else CAPS
         self._write = write
         self.reconcile_seconds = reconcile_seconds
@@ -245,6 +247,20 @@ class Bridge:
     def emit(self, line: dict[str, Any]) -> None:
         self._write(line)
 
+    def _emit_hello(self) -> None:
+        self.emit({"type": "hello", "version": PROTOCOL_VERSION, "caps": self.caps})
+
+    def _declare_threads(self, topics: bool) -> None:
+        """Declare `threads` when the backend's records name forum topics, or
+        stop declaring it when they no longer do; the hub keeps the latest caps,
+        so a changed answer goes out as a new `hello`."""
+        threads = self._threads or topics
+        caps = {**CAPS, "threads": "topic"} if threads else CAPS
+        if caps != self.caps:
+            self.caps = caps
+            log.info("threads: %s", caps.get("threads", "none"))
+            self._emit_hello()
+
     def handle_hub_line(self, raw: str) -> None:
         raw = raw.strip()
         if not raw:
@@ -264,7 +280,7 @@ class Bridge:
                 self.hello_cursor = self.cursor
                 self._hello_at = time.monotonic()
                 log.info("hello: bridge %s, cursor %s", line.get("bridge"), self.cursor)
-                self.emit({"type": "hello", "version": PROTOCOL_VERSION, "caps": self.caps})
+                self._emit_hello()
             self.hello_seen.set()
         elif kind == "out":
             out_id = _parse_id(line.get("id"))
@@ -593,6 +609,7 @@ class Bridge:
 
     async def _startup(self) -> None:
         await self._backend.start()
+        self._declare_threads(self._backend.topics)
         if self.chat_id is None:
             await self._resolve_chat()
         # Learn the event log's position before reading, so nothing that

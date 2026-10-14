@@ -20,6 +20,23 @@ Messages of the chat with an id above `after_id`, oldest first; without `after_i
 
 `chat_type` is `private`, `group`, `supergroup` or `channel`. A record may also carry `media` (`photo`, `voice`, `video_note`, `video`, `audio`, `gif`, `document: <name>`, `sticker <alt>`, `contact`, `geo`, `poll`), `duration`, `poll.question`, `forwarded` (`from_user`, `from_chat` or `from_name`), `transcript`, `action` (a service message) and `custom_emojis` (`[{"emoji": "🤖", "id": "…"}]`). It may also carry `sender_photo`: the id of the sender's current profile photo, `""` for none or hidden.
 
+## Forum topics
+
+A telegram-mcp server that names forum topics says so in the description of `get_messages_after`, which mentions its `topics` field. Then a record of a message in a topic carries `topic`, the topic's id (the id of the topic's first message), and the result carries one `topics` map of id to title for the topics present, so no title repeats per record:
+
+```json
+{"chat_id": -1001234567890, "chat_type": "supergroup", "has_more": false,
+ "messages": [{"id": 5520, "…": "…", "topic": 77},
+              {"id": 5521, "…": "…", "topic": 77, "reply_to": 5520}],
+ "topics": {"77": "Release"}}
+```
+
+`reply_to` is only a real reply: a message that merely sits in a topic has none. The backend copies each title into its record as `topic_title`, so records are the same as the Telethon backend's, and the bridge makes each topic a titled Agora thread as described in [Architecture](architecture.md#forum-topics). The General topic (`topic` 1) is the room's, so the backend drops its `topic`. A topic the map does not name (the server could not read its title) is a thread without a title.
+
+Once `start` has seen that mark, the bridge declares `threads: topic` in a second `hello`. A server without the mark (upstream telegram-mcp, or a fork without topics) leaves `topic` out of the records and `threads` out of the caps, and a forum's messages land in the room. The check runs on every connection, so the caps follow a server that is changed.
+
+An `out` line with a `thread` goes into the topic by `send_message` with `reply_to` set to the topic's id (the first part to its own `reply_to` when it has one, as in the Telethon backend); `send_message` needs nothing else for topics. The server's `wait_for_events` events carry `topic` too; the bridge only uses them as a signal.
+
 ## `get_profile_photo` (optional)
 
 Arguments: `peer_id`.
