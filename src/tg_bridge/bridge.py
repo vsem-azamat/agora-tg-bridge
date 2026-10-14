@@ -432,7 +432,7 @@ class Bridge:
                     continue
                 if _parse_id(rec.get("reply_to")) != job.copy_reply(job.done):
                     continue
-                if job.topic is not None and rec.get("topic", job.topic) != job.topic:
+                if rec.get("topic") != job.topic:  # a topic's copy, or a room's, only
                     continue
                 job.ids.append(rec["id"])
                 self._remember_own(rec["id"])

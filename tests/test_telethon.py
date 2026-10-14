@@ -1197,3 +1197,45 @@ def test_a_reply_to_another_chats_message_replies_to_nothing_here():
     )
     rec = to_record(in_77, "supergroup")
     assert rec["topic"] == 77 and "reply_to" not in rec
+
+
+async def test_a_copy_in_the_general_topic_is_not_claimed_for_a_topic():
+    general = tg_msg(
+        81,
+        f"{ROBOT} secretary: at five",
+        sender=ME,
+        out=True,
+        entities=[types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))],
+    )
+    client = forum_client(in_topic(80, 77, "release today"), general)
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    bridge.handle_hub_line(topic_out(5, "at five"))
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert [s["reply_to"] for s in client.sends] == [77]
+    await stop_bridge(bridge, task)
+
+
+async def test_a_copy_in_a_topic_is_not_claimed_for_the_room():
+    in_77 = tg_msg(
+        81,
+        f"{ROBOT} secretary: at five",
+        sender=ME,
+        out=True,
+        entities=[types.MessageEntityCustomEmoji(offset=0, length=2, document_id=int(EMOJI_ID))],
+        reply_to=types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=77),
+    )
+    client = forum_client(in_topic(80, 77, "release today"), in_77)
+    out = Out()
+    bridge = forum_bridge(out)
+    bridge.handle_hub_line(hello("80"))
+    author = {"name": "secretary", "kind": "agent", "display": "secretary"}
+    bridge.handle_hub_line(
+        json.dumps({"type": "out", "id": 5, "author": author, "text": "at five"})
+    )
+    task = asyncio.create_task(bridge.serve(backend_for(client)))
+    await settle()
+    assert len(client.sends) == 1 and client.sends[0].get("reply_to") is None
+    await stop_bridge(bridge, task)
